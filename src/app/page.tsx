@@ -3,9 +3,9 @@
 import { useState, useCallback } from "react";
 import { BleClient } from "@capacitor-community/bluetooth-le";
 
-// UUIDs for Battery Service (BLE standard)
-const BATTERY_SERVICE = "180f";
-const BATTERY_CHARACTERISTIC = "2a19";
+// UUIDs for Battery Service (BLE standard) – full 128-bit form required by the plugin
+const BATTERY_SERVICE = "0000180f-0000-1000-8000-00805f9b34fb";
+const BATTERY_CHARACTERISTIC = "00002a19-0000-1000-8000-00805f9b34fb";
 
 type AppStatus =
   | "idle"
@@ -34,6 +34,24 @@ export default function Home() {
       setStatus("initializing");
       setStatusMessage("Initializing Bluetooth...");
       await BleClient.initialize({ androidNeverForLocation: true });
+
+      // ── Step 1b: Request runtime permissions (Android 12+) ──────────
+      const permissions = await BleClient.checkPermissions();
+      const needsRequest = (
+        permissions.bluetooth !== "granted" ||
+        permissions.location !== "granted"
+      );
+      if (needsRequest) {
+        setStatusMessage("Requesting Bluetooth permissions...");
+        const result = await BleClient.requestPermissions();
+        if (
+          result.bluetooth !== "granted"
+        ) {
+          throw new Error(
+            "Bluetooth permission denied. Please allow Bluetooth access and try again."
+          );
+        }
+      }
 
       // ── Step 2: Scan – show picker filtered to Battery Service ──────
       setStatus("scanning");
