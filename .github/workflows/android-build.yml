@@ -1,0 +1,60 @@
+name: Android Debug APK Build
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Debug APK
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ───────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Node.js ────────────────────────────────────────────────────
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # ── 3. Java 17 (required for modern Capacitor/Android Gradle) ─────
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: 17
+
+      # ── 4. Install dependencies ───────────────────────────────────────
+      - name: Install npm dependencies
+        run: npm install
+
+      # ── 5. Build Next.js static export → out/ ────────────────────────
+      - name: Build Next.js static site
+        run: npm run build
+
+      # ── 6. Sync web assets & plugins into the Android project ─────────
+      - name: Sync Capacitor Android
+        run: npx cap sync android
+
+      # ── 7. Make Gradle wrapper executable ────────────────────────────
+      - name: Grant Gradle wrapper execute permission
+        run: chmod +x android/gradlew
+
+      # ── 8. Assemble debug APK ─────────────────────────────────────────
+      - name: Build debug APK
+        working-directory: android
+        run: ./gradlew assembleDebug
+
+      # ── 9. Upload APK artifact (7-day retention) ──────────────────────
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ble-poc-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 7
