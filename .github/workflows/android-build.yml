@@ -24,11 +24,11 @@ jobs:
           cache: npm
 
       # ── 3. Java 17 (required for modern Capacitor/Android Gradle) ─────
-      - name: Set up JDK 17
+      - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
           distribution: zulu
-          java-version: 17
+          java-version: 21
 
       # ── 4. Install dependencies ───────────────────────────────────────
       - name: Install npm dependencies
