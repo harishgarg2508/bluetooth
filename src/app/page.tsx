@@ -37,11 +37,15 @@ export default function Home() {
 
       // ── Step 2: Scan – show picker filtered to Battery Service ──────
       setStatus("scanning");
-      setStatusMessage("Scanning for devices... A picker will appear.");
+      setStatusMessage(
+        "Scanning for BLE devices... Put your earbuds in PAIRING MODE so they appear in the list."
+      );
 
       const device = await BleClient.requestDevice({
-        services: [BATTERY_SERVICE],
-        optionalServices: [],
+        // No services filter → show ALL nearby BLE devices in the picker.
+        // BATTERY_SERVICE listed as optional so we can access it after connecting
+        // even if the device didn't advertise it.
+        optionalServices: [BATTERY_SERVICE],
       });
 
       deviceId = device.deviceId;
@@ -120,8 +124,9 @@ export default function Home() {
             BLE Battery Reader
           </h1>
           <p className="mt-1 text-sm text-slate-400">
-            Connects via Bluetooth Low Energy and reads the Battery Service
-            (0x180F).
+            Connects via Bluetooth Low Energy (BLE) and reads the Battery Service (0x180F).
+            <br />
+            <span className="text-yellow-400">⚠ Earbuds must be in pairing mode to appear.</span>
           </p>
         </div>
 
