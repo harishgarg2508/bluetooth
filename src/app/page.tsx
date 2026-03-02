@@ -36,21 +36,12 @@ export default function Home() {
       await BleClient.initialize({ androidNeverForLocation: true });
 
       // ── Step 1b: Request runtime permissions (Android 12+) ──────────
-      const permissions = await BleClient.checkPermissions();
-      const needsRequest = (
-        permissions.bluetooth !== "granted" ||
-        permissions.location !== "granted"
-      );
-      if (needsRequest) {
-        setStatusMessage("Requesting Bluetooth permissions...");
-        const result = await BleClient.requestPermissions();
-        if (
-          result.bluetooth !== "granted"
-        ) {
-          throw new Error(
-            "Bluetooth permission denied. Please allow Bluetooth access and try again."
-          );
-        }
+      setStatusMessage("Requesting Bluetooth permissions...");
+      const result = await BleClient.requestPermissions();
+      if (result.bluetooth !== "granted") {
+        throw new Error(
+          "Bluetooth permission denied. Please allow Bluetooth access and try again."
+        );
       }
 
       // ── Step 2: Scan – show picker filtered to Battery Service ──────
