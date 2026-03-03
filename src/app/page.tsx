@@ -123,24 +123,50 @@ function toHexDump(raw: string, maxBytes = 24): string {
   return out.trim();
 }
 
-// Parse battery from BINARY packet (glasses SDK binary protocol):
-//   loadData[6] = 0x03 → battery packet
+// Parse battery from BINARY packet (Orange Wireless Glasses SDK):
+//   loadData[6] = 0x05 → glasses battery report
 //   loadData[7] = battery level (0–100)
-//   loadData[8] = charging status (0=no, non-zero=yes)
+//   loadData[8] = charging status (0=not charging, non-zero=charging)
 function parseBatteryBinary(raw: string): { level: number; charging: boolean } | null {
-  // Primary: packet with 6-byte header (SDK: loadData[6] = cmdType)
-  if (raw.length >= 9 && raw.charCodeAt(6) === 0x03) {
+  // Primary: known header length — cmdType at index 6
+  if (raw.length >= 9 && raw.charCodeAt(6) === 0x05) {
     const level = raw.charCodeAt(7);
     const charging = raw.charCodeAt(8) !== 0;
     if (level >= 0 && level <= 100) return { level, charging };
   }
-  // Fallback: scan for 0x03 command byte anywhere in packet
-  // (handles variable-length headers)
+  // Fallback: scan the whole packet for 0x05 cmdType byte
+  // (handles variable-length packet headers / framing variants)
   for (let i = 0; i < raw.length - 2; i++) {
-    if (raw.charCodeAt(i) === 0x03) {
+    if (raw.charCodeAt(i) === 0x05) {
       const level = raw.charCodeAt(i + 1);
       const charging = raw.charCodeAt(i + 2) !== 0;
       if (level > 0 && level <= 100) return { level, charging };
+    }
+  }
+  return null;
+}
+
+// Parse un-synced media counts from binary response to glassesControl([0x02, 0x04]).
+// Response cmdType is 0x04; counts at loadData[7], [8], [9].
+interface MediaCounts { images: number; videos: number; recordings: number; }
+function parseMediaCounts(raw: string): MediaCounts | null {
+  if (!isBinaryData(raw)) return null;
+  // Primary: cmdType 0x04 at index 6
+  if (raw.length >= 10 && raw.charCodeAt(6) === 0x04) {
+    return {
+      images:     raw.charCodeAt(7),
+      videos:     raw.charCodeAt(8),
+      recordings: raw.charCodeAt(9),
+    };
+  }
+  // Fallback: scan for 0x04 byte followed by plausible counts
+  for (let i = 0; i < raw.length - 3; i++) {
+    if (raw.charCodeAt(i) === 0x04) {
+      const img = raw.charCodeAt(i + 1);
+      const vid = raw.charCodeAt(i + 2);
+      const rec = raw.charCodeAt(i + 3);
+      if ((img + vid + rec) > 0 && img < 10000 && vid < 10000 && rec < 10000)
+        return { images: img, videos: vid, recordings: rec };
     }
   }
   return null;
@@ -193,15 +219,18 @@ export default function Home() {
   const [isSending, setIsSending] = useState(false);
   // Battery helpers
   const [lastRxLine, setLastRxLine] = useState("");
-  const [batCmd, setBatCmd] = useState("AT+CBC\r\n");
+  const [batCmd, setBatCmd] = useState("");
   const [showBatCmdEdit, setShowBatCmdEdit] = useState(false);
   const [manualBatInput, setManualBatInput] = useState("");
-  // Import 
+  // Import
   const [deviceItems, setDeviceItems] = useState<DeviceItem[]>([]);
   const [isListing, setIsListing] = useState(false);
   const [listCmd, setListCmd] = useState("LIST\r\n");
   const [getCmd, setGetCmd] = useState("GET:");
   const [importingItem, setImportingItem] = useState<string | null>(null);
+  // Media counts (from binary glassesControl [0x02, 0x04] response)
+  const [mediaCounts, setMediaCounts] = useState<MediaCounts | null>(null);
+  const [isCheckingMedia, setIsCheckingMedia] = useState(false);
   const logEndRef = useRef<HTMLDivElement>(null);
   const listenerRef = useRef<{ remove: () => void } | null>(null);
   const rxBufferRef = useRef<string>("");
@@ -333,11 +362,18 @@ export default function Home() {
               const firstLine = data.split(/\r?\n/)[0].trim().slice(0, 80);
               if (firstLine) setLastRxLine(firstLine);
             }
-            // Auto-parse battery (binary or text protocol)
+            // Auto-parse battery (binary cmdType 0x05 or text fallback)
             const parsed = parseBattery(data);
             if (parsed !== null) {
               setBatteryLevel(parsed.level);
               setIsCharging(parsed.charging);
+            }
+            // Auto-parse media counts (binary cmdType 0x04 response to [0x02,0x04])
+            const counts = parseMediaCounts(data);
+            if (counts !== null) {
+              setMediaCounts(counts);
+              setIsCheckingMedia(false);
+              addLog("sys", `Media: ${counts.images} image(s), ${counts.videos} video(s), ${counts.recordings} recording(s)`);
             }
             // File frame assembly
             rxBufferRef.current += data;
@@ -364,6 +400,7 @@ export default function Home() {
         setBatteryLevel(null);
         setIsCharging(false);
         setLastRxLine("");
+        setMediaCounts(null);
         rxBufferRef.current = "";
         receivedFilesRef.current = [];
         setReceivedFiles([]);
@@ -429,6 +466,7 @@ export default function Home() {
     setConnectedDevice(null);
     setBatteryLevel(null);
     setIsCharging(false);
+    setMediaCounts(null);
     setAppState("idle");
     setDevices([]);
     setStatusMsg("Disconnected. Tap 'Scan' to connect again.");
@@ -436,15 +474,41 @@ export default function Home() {
   }, [addLog]);
 
   // ── Request battery level from device ─────────────────────────────
+  // Sends binary syncBattery command [0x02, 0x05] per Orange Wireless SDK.
+  // If the user has typed a custom AT command in the bat cmd field, that is
+  // sent instead (allows fallback for non-SDK-standard glasses).
   const handleRequestBattery = useCallback(async () => {
     try {
-      const cmd = batCmd.replace(/\\r/g, "\r").replace(/\\n/g, "\n");
-      await BluetoothCommunication.sendData({ data: cmd });
-      addLog("tx", `Battery query: ${JSON.stringify(batCmd.trim())}`);
+      if (batCmd.trim().length > 0) {
+        // User has a custom text command — send it
+        const cmd = batCmd.replace(/\\r/g, "\r").replace(/\\n/g, "\n");
+        await BluetoothCommunication.sendData({ data: cmd });
+        addLog("tx", `Battery cmd (custom): ${JSON.stringify(batCmd.trim())}`);
+      } else {
+        // Default: binary syncBattery() per SDK
+        const binary = String.fromCharCode(0x02, 0x05);
+        await BluetoothCommunication.sendData({ data: binary });
+        addLog("tx", "Battery sync: [02 05] (binary syncBattery)");
+      }
     } catch (err: unknown) {
       addLog("sys", `Battery request failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }, [addLog, batCmd]);
+
+  // ── Check un-synced media count [0x02, 0x04] ──────────────────────
+  const handleCheckMedia = useCallback(async () => {
+    setIsCheckingMedia(true);
+    try {
+      const binary = String.fromCharCode(0x02, 0x04);
+      await BluetoothCommunication.sendData({ data: binary });
+      addLog("tx", "Media check: [02 04] (glassesControl)");
+      // Safety timeout: clear spinner after 10 s if no response
+      setTimeout(() => setIsCheckingMedia(false), 10000);
+    } catch (err: unknown) {
+      setIsCheckingMedia(false);
+      addLog("sys", `Media check failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }, [addLog]);
 
   // ── Send a file over RFCOMM (base64-chunked framing protocol) ─────
   const handleFileChange = useCallback(
@@ -672,44 +736,51 @@ export default function Home() {
                 </div>
               </div>
               {/* Collapsible command + manual-set row */}
-              {showBatCmdEdit && (
-                <div className="border-t border-slate-600/40 px-3 py-2.5 flex flex-col gap-2">
-                  <div className="flex gap-2 items-center">
-                    <span className="text-[10px] text-slate-500 w-16 shrink-0">Bat cmd:</span>
-                    <input
-                      value={batCmd}
-                      onChange={(e) => setBatCmd(e.target.value)}
-                      placeholder="AT+CBC\r\n"
-                      className="flex-1 rounded-lg bg-slate-900 px-2 py-1 text-xs text-white font-mono placeholder-slate-600 focus:outline-none focus:ring-1 focus:ring-blue-500"
-                    />
-                    <button
-                      onClick={() => setBatCmd("AT+CBC\r\n")}
-                      className="text-[10px] text-slate-500 hover:text-slate-300 transition-colors"
-                    >
-                      Reset
-                    </button>
-                  </div>
-                  <div className="flex gap-2 items-center">
-                    <span className="text-[10px] text-slate-500 w-16 shrink-0">Set manually:</span>
-                    <input
-                      type="number" min={0} max={100}
-                      value={manualBatInput}
-                      onChange={(e) => setManualBatInput(e.target.value)}
-                      placeholder="0–100"
-                      className="w-16 rounded-lg bg-slate-900 px-2 py-1 text-xs text-white text-center focus:outline-none focus:ring-1 focus:ring-blue-500"
-                    />
-                    <button
-                      onClick={() => {
-                        const v = parseInt(manualBatInput, 10);
-                        if (!isNaN(v) && v >= 0 && v <= 100) { setBatteryLevel(v); setManualBatInput(""); }
-                      }}
-                      className="rounded-lg bg-slate-600 px-3 py-1 text-[10px] font-semibold text-white hover:bg-slate-500"
-                    >
-                      Set
-                    </button>
-                  </div>
-                </div>
-              )}
+                  {showBatCmdEdit && (
+                    <div className="border-t border-slate-600/40 px-3 py-2.5 flex flex-col gap-2">
+                      <p className="text-[10px] text-slate-500 leading-relaxed">
+                        Default sends binary
+                        <span className="font-mono text-slate-400 mx-1">[02 05]</span>
+                        (<span className="text-slate-400">syncBattery()</span> — Orange SDK).
+                        Enter a custom AT command below to override:
+                      </p>
+                      <div className="flex gap-2 items-center">
+                        <input
+                          value={batCmd}
+                          onChange={(e) => setBatCmd(e.target.value)}
+                          placeholder="leave empty for binary [02 05]"
+                          className="flex-1 rounded-lg bg-slate-900 px-2 py-1 text-xs text-white font-mono placeholder-slate-600 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                        />
+                        {batCmd.trim().length > 0 && (
+                          <button
+                            onClick={() => setBatCmd("")}
+                            className="text-[10px] text-red-500/70 hover:text-red-400 transition-colors"
+                          >
+                            Clear
+                          </button>
+                        )}
+                      </div>
+                      <div className="flex gap-2 items-center">
+                        <span className="text-[10px] text-slate-500 w-16 shrink-0">Set manually:</span>
+                        <input
+                          type="number" min={0} max={100}
+                          value={manualBatInput}
+                          onChange={(e) => setManualBatInput(e.target.value)}
+                          placeholder="0–100"
+                          className="w-16 rounded-lg bg-slate-900 px-2 py-1 text-xs text-white text-center focus:outline-none focus:ring-1 focus:ring-blue-500"
+                        />
+                        <button
+                          onClick={() => {
+                            const v = parseInt(manualBatInput, 10);
+                            if (!isNaN(v) && v >= 0 && v <= 100) { setBatteryLevel(v); setManualBatInput(""); }
+                          }}
+                          className="rounded-lg bg-slate-600 px-3 py-1 text-[10px] font-semibold text-white hover:bg-slate-500"
+                        >
+                          Set
+                        </button>
+                      </div>
+                    </div>
+                  )}
             </div>
 
             {/* ── Tab bar ────────────────────────────────────────── */}
@@ -731,9 +802,11 @@ export default function Home() {
                       {receivedFiles.length}
                     </span>
                   )}
-                  {tab === "import" && deviceItems.length > 0 && (
+                  {tab === "import" && (mediaCounts || deviceItems.length > 0) && (
                     <span className="ml-1 rounded-full bg-violet-500 px-1.5 py-0.5 text-[10px] font-bold text-white">
-                      {deviceItems.length}
+                      {mediaCounts
+                        ? mediaCounts.images + mediaCounts.videos + mediaCounts.recordings
+                        : deviceItems.length}
                     </span>
                   )}
                 </button>
@@ -872,9 +945,55 @@ export default function Home() {
             {activeTab === "import" && (
               <div className="flex flex-col gap-3">
 
-                {/* Command config */}
+                {/* ── Media counts (binary [0x02, 0x04] protocol) ── */}
+                <div className="rounded-xl bg-slate-700/50 border border-slate-600/50 px-4 py-3 flex flex-col gap-3">
+                  <div className="flex items-center justify-between">
+                    <p className="text-xs font-semibold uppercase tracking-widest text-slate-400">Un-synced Media</p>
+                    <button
+                      onClick={handleCheckMedia}
+                      disabled={isCheckingMedia}
+                      className="flex items-center gap-1.5 rounded-lg bg-violet-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-violet-500 active:scale-95 transition-all disabled:opacity-60"
+                    >
+                      {isCheckingMedia ? (
+                        <>
+                          <svg className="h-3 w-3 animate-spin" fill="none" viewBox="0 0 24 24">
+                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+                          </svg>
+                          Checking…
+                        </>
+                      ) : "↻ Check"}
+                    </button>
+                  </div>
+                  {mediaCounts ? (
+                    <div className="grid grid-cols-3 gap-2">
+                      {[
+                        { icon: "🖼️", label: "Images",     count: mediaCounts.images },
+                        { icon: "🎥", label: "Videos",     count: mediaCounts.videos },
+                        { icon: "🎙️", label: "Recordings", count: mediaCounts.recordings },
+                      ].map(({ icon, label, count }) => (
+                        <div key={label} className="rounded-lg bg-slate-900/60 border border-slate-700 px-2 py-2.5 text-center">
+                          <p className="text-xl">{icon}</p>
+                          <p className="text-lg font-black text-white tabular-nums leading-none mt-1">{count}</p>
+                          <p className="text-[10px] text-slate-500 mt-0.5">{label}</p>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-xs text-slate-500 text-center py-1">
+                      Tap <span className="text-violet-400">↻ Check</span> to query glasses via binary command{" "}
+                      <span className="font-mono text-slate-400">[02 04]</span>
+                    </p>
+                  )}
+                  <p className="text-[10px] text-slate-600 leading-relaxed">
+                    Uses <span className="text-slate-500 font-mono">glassesControl([0x02, 0x04])</span> — Orange Wireless SDK.
+                    The glasses respond with image/video/recording counts automatically parsed from the binary reply.
+                  </p>
+                </div>
+
+                {/* ── Manual file list (text protocol fallback) ── */}
                 <div className="rounded-xl bg-slate-700/50 border border-slate-600/50 px-4 py-3 flex flex-col gap-2">
-                  <p className="text-xs font-semibold uppercase tracking-widest text-slate-400">Device Commands</p>
+                  <p className="text-xs font-semibold uppercase tracking-widest text-slate-400">Manual File List</p>
                   <div className="flex gap-2 items-center">
                     <span className="text-[10px] text-slate-500 w-16 shrink-0">List cmd:</span>
                     <input
@@ -896,11 +1015,11 @@ export default function Home() {
                   <button
                     onClick={handleListFiles}
                     disabled={isListing}
-                    className="flex items-center justify-center gap-2 w-full rounded-xl bg-violet-600 py-2.5 text-sm font-semibold text-white hover:bg-violet-500 active:scale-95 transition-all disabled:opacity-60"
+                    className="flex items-center justify-center gap-2 w-full rounded-xl bg-slate-600 py-2 text-xs font-semibold text-slate-200 hover:bg-slate-500 active:scale-95 transition-all disabled:opacity-60"
                   >
                     {isListing ? (
                       <>
-                        <svg className="h-4 w-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                        <svg className="h-3.5 w-3.5 animate-spin" fill="none" viewBox="0 0 24 24">
                           <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                           <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
                         </svg>
