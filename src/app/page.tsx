@@ -377,45 +377,57 @@ export default function Home() {
       const services = await BleClient.getServices(address);
       setBleServices(services);
 
-      // ── Subscribe to Orange command channel (hardcoded NUS UUIDs) ────
+      // ── Set write channel (NUS RX char) ─────────────────────────────
       const hasOrangeSvc = services.some((s) => s.uuid === ORANGE_CMD_SVC);
       if (hasOrangeSvc) {
-        try {
-          await BleClient.startNotifications(address, ORANGE_CMD_SVC, ORANGE_CMD_NOTIFY, (dv) => {
-            const bytes = new Uint8Array(dv.buffer);
-            const hex = Array.from(bytes).map((b) => b.toString(16).padStart(2, "0").toUpperCase()).join(" ");
-            addLog("sys", `NUS RX raw: ${hex}`);
-            const result = parseBleDataView(bytes, ORANGE_CMD_SVC, ORANGE_CMD_NOTIFY);
-            if (result.type === "battery") {
-              setBatteryLevel(result.level);
-              setIsCharging(result.charging);
-            } else if (result.type === "media") {
-              setMediaCounts({ images: result.images, videos: result.videos, recordings: result.recordings });
-              setIsCheckingMedia(false);
-              addLog("sys", `Media counts: ${result.images} img · ${result.videos} vid · ${result.recordings} rec`);
-            }
-            // raw hex already logged above
-          });
-          setBleWriteSvc(ORANGE_CMD_SVC);
-          setBleWriteChar(ORANGE_CMD_WRITE);
-          addLog("sys", "NUS command channel ready ✓ (write: 6e400002, notify: 6e400003)");
-        } catch (err) {
-          addLog("sys", `NUS subscribe failed: ${err instanceof Error ? err.message : String(err)}`);
-        }
+        setBleWriteSvc(ORANGE_CMD_SVC);
+        setBleWriteChar(ORANGE_CMD_WRITE);
+        addLog("sys", "NUS command channel ready ✓ (write: 6e400002, notify: 6e400003)");
       } else {
-        addLog("sys", "⚠ Orange NUS service not found — media count will not work");
+        addLog("sys", "⚠ Orange NUS service not found — media count may not work");
       }
 
-      // ── Standard Battery Service (if present) ─────────────────────
+      // ── Subscribe to ALL notify/indicate chars across every service ──
+      // (battery comes from a proprietary service, not just NUS)
+      const SKIP_SVCS = ["00001800", "00001801", "0000180a"];
+      for (const svc of services) {
+        if (SKIP_SVCS.some((p) => svc.uuid.startsWith(p))) continue;
+        for (const chr of svc.characteristics ?? []) {
+          if (!chr.properties.notify && !chr.properties.indicate) continue;
+          try {
+            const capSvc = svc.uuid;
+            const capChr = chr.uuid;
+            const isNusTx = capChr === ORANGE_CMD_NOTIFY;
+            await BleClient.startNotifications(address, capSvc, capChr, (dv) => {
+              const bytes = new Uint8Array(dv.buffer);
+              const hex = Array.from(bytes)
+                .map((b) => b.toString(16).padStart(2, "0").toUpperCase()).join(" ");
+              // Always log raw bytes so we can see what the glasses actually send
+              addLog("sys", `BLE [${capChr.slice(4,8)}]: ${hex}`);
+              // Parse typed result
+              const result = parseBleDataView(bytes, capSvc, capChr);
+              if (result.type === "battery") {
+                setBatteryLevel(result.level);
+                setIsCharging(result.charging);
+              } else if (result.type === "media") {
+                setMediaCounts({ images: result.images, videos: result.videos, recordings: result.recordings });
+                setIsCheckingMedia(false);
+                addLog("sys", `✓ Media: ${result.images} img · ${result.videos} vid · ${result.recordings} rec`);
+              } else if (!isNusTx) {
+                // non-NUS raw — already logged above, nothing extra needed
+              }
+            });
+          } catch { /* char not subscribable — skip */ }
+        }
+      }
+
+      // Standard Battery Service explicit read (if present)
       if (services.some((s) => s.uuid.startsWith("0000180f"))) {
         try {
           const dv = await BleClient.read(address, BLE_BATTERY_SVC, BLE_BATTERY_CHAR);
           setBatteryLevel(dv.getUint8(0));
-          addLog("sys", `BLE Battery (standard): ${dv.getUint8(0)}%`);
-          await BleClient.startNotifications(address, BLE_BATTERY_SVC, BLE_BATTERY_CHAR, (dv) => {
-            setBatteryLevel(dv.getUint8(0));
-          });
-        } catch { /* battery comes via NUS notifications instead */ }
+          addLog("sys", `BLE Battery (0x180F): ${dv.getUint8(0)}%`);
+        } catch { /* will arrive via notification */ }
       }
 
       addLog("sys", `BLE ready · ${services.length} service(s) · NUS: ${hasOrangeSvc ? "✓" : "✗"}`);
@@ -608,7 +620,7 @@ export default function Home() {
     if (bleConnected && bleDeviceIdRef.current && bleWriteSvc && bleWriteChar) {
       try {
         const dv = new DataView(new Uint8Array([0x02, 0x05]).buffer);
-        await BleClient.write(bleDeviceIdRef.current, bleWriteSvc, bleWriteChar, dv);
+        await BleClient.writeWithoutResponse(bleDeviceIdRef.current, bleWriteSvc, bleWriteChar, dv);
         addLog("sys", "BLE → syncBattery() [02 05] — waiting for notification…");
         return;
       } catch (err: unknown) {
@@ -641,7 +653,7 @@ export default function Home() {
     setIsCheckingMedia(true);
     try {
       const dv = new DataView(new Uint8Array([0x02, 0x04]).buffer);
-      await BleClient.write(bleDeviceIdRef.current, bleWriteSvc, bleWriteChar, dv);
+      await BleClient.writeWithoutResponse(bleDeviceIdRef.current, bleWriteSvc, bleWriteChar, dv);
       addLog("sys", "BLE → glassesControl([02 04]) — waiting for media count…");
       setTimeout(() => setIsCheckingMedia(false), 10000);
     } catch (err: unknown) {
