@@ -215,6 +215,14 @@ const ORANGE_CMD_SVC    = "6e40fff0-b5a3-f393-e0a9-e50e24dcca9e";
 const ORANGE_CMD_WRITE  = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // RX char — we WRITE here
 const ORANGE_CMD_NOTIFY = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // TX char — responses NOTIFY here
 
+// ── Orange glasses MAIN proprietary service (ae30) ───────────────────
+// 6 chars confirmed: ae01[WNR] ae02[N] ae03[WNR] ae04[N] ae05[I] ae10[R/W]
+// ae01/ae03 = write commands, ae02/ae04/ae05 = notify responses, ae10 = readable register
+const ORANGE_MAIN_SVC    = "0000ae30-0000-1000-8000-00805f9b34fb";
+const ORANGE_MAIN_WRITE1 = "0000ae01-0000-1000-8000-00805f9b34fb"; // primary write
+const ORANGE_MAIN_WRITE2 = "0000ae03-0000-1000-8000-00805f9b34fb"; // secondary write
+const ORANGE_MAIN_READ   = "0000ae10-0000-1000-8000-00805f9b34fb"; // readable register
+
 /** Parse an incoming BLE notification into a typed result — pure function. */
 function parseBleDataView(
   bytes: Uint8Array,
@@ -391,14 +399,34 @@ export default function Home() {
         }).join("\n");
         addLog("sys", `svc ${svc.uuid.slice(4,8)} (${chars.length} char):\n${charSummary || "  (none)"}`);
       }
+      const hasMainSvc   = services.some((s) => s.uuid === ORANGE_MAIN_SVC);
       const hasOrangeSvc = services.some((s) => s.uuid === ORANGE_CMD_SVC);
-      addLog("sys", `NUS svc present: ${hasOrangeSvc}`);
-      if (hasOrangeSvc) {
+      addLog("sys", `ae30 present: ${hasMainSvc}  NUS present: ${hasOrangeSvc}`);
+      if (hasMainSvc) {
+        setBleWriteSvc(ORANGE_MAIN_SVC);
+        setBleWriteChar(ORANGE_MAIN_WRITE1);
+        addLog("sys", "Write channel → ae30/ae01 ✓");
+        // Try reading ae10 directly — likely battery or device state register
+        try {
+          const dv = await BleClient.read(address, ORANGE_MAIN_SVC, ORANGE_MAIN_READ);
+          const bytes = new Uint8Array(dv.buffer);
+          const hex = Array.from(bytes).map((b) => b.toString(16).padStart(2,"0").toUpperCase()).join(" ");
+          addLog("sys", `ae10 READ (${bytes.length}B): ${hex}`);
+          if (bytes.length === 1) {
+            setBatteryLevel(bytes[0]);
+            addLog("sys", `→ battery from ae10: ${bytes[0]}%`);
+          } else if (bytes.length >= 2) {
+            addLog("sys", `ae10[0]=${bytes[0]} ae10[1]=${bytes[1]} (check hex for battery value)`);
+          }
+        } catch (e) {
+          addLog("sys", `ae10 read err: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      } else if (hasOrangeSvc) {
         setBleWriteSvc(ORANGE_CMD_SVC);
         setBleWriteChar(ORANGE_CMD_WRITE);
-        addLog("sys", "NUS command channel ready ✓ (write: 6e400002, notify: 6e400003)");
+        addLog("sys", "Write channel → NUS fff0/0002 (ae30 not found)");
       } else {
-        addLog("sys", "⚠ Orange NUS service not found — media count may not work");
+        addLog("sys", "⚠ No known write service — commands cannot be sent");
       }
 
       // ── Subscribe to ALL notify/indicate chars across every service ──
@@ -459,7 +487,7 @@ export default function Home() {
         } catch { /* will arrive via notification */ }
       }
 
-      addLog("sys", `BLE ready · ${services.length} service(s) · NUS: ${hasOrangeSvc ? "✓" : "✗"}`);
+      addLog("sys", `BLE ready · ${services.length} service(s) · ae30: ${hasMainSvc ? "✓" : "✗"} NUS: ${hasOrangeSvc ? "✓" : "✗"}`);
     } catch (err: unknown) {
       setBleStatus("error");
       setBleConnected(false);
@@ -643,22 +671,46 @@ export default function Home() {
   }, [addLog]);
 
   // ── Request battery level ────────────────────────────────────────
-  // BLE path (correct): write [0x02, 0x05] → syncBattery() via GATT.
-  // Fallback: custom AT text command over Classic BT if user provides one.
+  // BLE path: write [0x02, 0x05] → syncBattery(). Try primary write char (ae01),
+  // then secondary (ae03), then re-read ae10 register directly.
   const handleRequestBattery = useCallback(async () => {
     addLog("sys",
-      `[REQ-BAT] bleConnected=${bleConnected} devId=${bleDeviceIdRef.current ?? "null"}` +
-      ` writeSvc=${bleWriteSvc?.slice(4,8) ?? "null"} writeChar=${bleWriteChar?.slice(4,8) ?? "null"}`
+      `[REQ-BAT] bleConn=${bleConnected} svc=${bleWriteSvc?.slice(4,8) ?? "null"} chr=${bleWriteChar?.slice(4,8) ?? "null"}`
     );
-    if (bleConnected && bleDeviceIdRef.current && bleWriteSvc && bleWriteChar) {
-      try {
-        const dv = new DataView(new Uint8Array([0x02, 0x05]).buffer);
-        await BleClient.writeWithoutResponse(bleDeviceIdRef.current, bleWriteSvc, bleWriteChar, dv);
-        addLog("sys", "BLE → syncBattery() [02 05] — waiting for notification…");
-        return;
-      } catch (err: unknown) {
-        addLog("sys", `BLE write failed: ${err instanceof Error ? err.message : String(err)}`);
+    if (bleConnected && bleDeviceIdRef.current) {
+      const devId = bleDeviceIdRef.current;
+      // Try primary write (ae01 or NUS 0002)
+      if (bleWriteSvc && bleWriteChar) {
+        try {
+          await BleClient.writeWithoutResponse(devId, bleWriteSvc, bleWriteChar,
+            new DataView(new Uint8Array([0x02, 0x05]).buffer));
+          addLog("sys", `→ [02 05] sent to ${bleWriteChar.slice(4,8)} — waiting…`);
+        } catch (err) {
+          addLog("sys", `write ae01 failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
       }
+      // Try secondary write (ae03) if primary is ae01
+      if (bleWriteChar === ORANGE_MAIN_WRITE1) {
+        try {
+          await BleClient.writeWithoutResponse(devId, ORANGE_MAIN_SVC, ORANGE_MAIN_WRITE2,
+            new DataView(new Uint8Array([0x02, 0x05]).buffer));
+          addLog("sys", "→ [02 05] also sent to ae03 — watching for response…");
+        } catch (err) {
+          addLog("sys", `write ae03 failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      // Also re-read ae10 directly (may contain current battery level)
+      try {
+        const dv = await BleClient.read(devId, ORANGE_MAIN_SVC, ORANGE_MAIN_READ);
+        const bytes = new Uint8Array(dv.buffer);
+        const hex = Array.from(bytes).map((b) => b.toString(16).padStart(2,"0").toUpperCase()).join(" ");
+        addLog("sys", `ae10 re-read (${bytes.length}B): ${hex}`);
+        if (bytes.length >= 1 && bytes[0] <= 100) {
+          setBatteryLevel(bytes[0]);
+          addLog("sys", `→ battery from ae10: ${bytes[0]}%`);
+        }
+      } catch { /* ae10 not available on this path */ }
+      return;
     }
     if (batCmd.trim().length > 0) {
       try {
@@ -689,9 +741,17 @@ export default function Home() {
     }
     setIsCheckingMedia(true);
     try {
-      const dv = new DataView(new Uint8Array([0x02, 0x04]).buffer);
-      await BleClient.writeWithoutResponse(bleDeviceIdRef.current, bleWriteSvc, bleWriteChar, dv);
-      addLog("sys", "BLE → glassesControl([02 04]) — waiting for media count…");
+      const devId = bleDeviceIdRef.current!;
+      const cmd = new DataView(new Uint8Array([0x02, 0x04]).buffer);
+      await BleClient.writeWithoutResponse(devId, bleWriteSvc, bleWriteChar, cmd);
+      addLog("sys", `→ [02 04] sent to ${bleWriteChar.slice(4,8)} — waiting for media count…`);
+      // Also try secondary write char (ae03) if primary is ae01
+      if (bleWriteChar === ORANGE_MAIN_WRITE1) {
+        try {
+          await BleClient.writeWithoutResponse(devId, ORANGE_MAIN_SVC, ORANGE_MAIN_WRITE2, cmd);
+          addLog("sys", "→ [02 04] also sent to ae03");
+        } catch { /* ignore */ }
+      }
       setTimeout(() => setIsCheckingMedia(false), 10000);
     } catch (err: unknown) {
       setIsCheckingMedia(false);
