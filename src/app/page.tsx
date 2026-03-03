@@ -18,6 +18,27 @@ interface LogEntry {
 
 let logCounter = 0;
 
+// Parse a battery percentage out of any SPP/RFCOMM data string.
+// Recognises: "85%", "battery:85", "bat=85", "+CBC:0,85", standalone "85"
+function parseBattery(raw: string): number | null {
+  const s = raw.toLowerCase().trim();
+  // Pattern: optional label then digits
+  const patterns = [
+    /bat(?:tery)?\s*[=:]\s*(\d{1,3})/,  // battery:85  bat=85
+    /\+cbc:\d+,(\d{1,3})/,              // AT+CBC: 0,85
+    /(\d{1,3})\s*%/,                    // 85%
+    /^(\d{1,3})$/,                      // bare number
+  ];
+  for (const re of patterns) {
+    const m = s.match(re);
+    if (m) {
+      const v = parseInt(m[1], 10);
+      if (v >= 0 && v <= 100) return v;
+    }
+  }
+  return null;
+}
+
 export default function Home() {
   const [appState, setAppState] = useState<AppState>("idle");
   const [statusMsg, setStatusMsg] = useState("Tap 'Scan' to find paired devices.");
@@ -26,6 +47,7 @@ export default function Home() {
   const [log, setLog] = useState<LogEntry[]>([]);
   const [inputText, setInputText] = useState("");
   const [isBusy, setIsBusy] = useState(false);
+  const [batteryLevel, setBatteryLevel] = useState<number | null>(null);
   const logEndRef = useRef<HTMLDivElement>(null);
   const listenerRef = useRef<{ remove: () => void } | null>(null);
 
@@ -91,12 +113,16 @@ export default function Home() {
           "dataReceived",
           (event: { data: string }) => {
             addLog("rx", event.data);
+            // Auto-detect battery level in any received string
+            const parsed = parseBattery(event.data);
+            if (parsed !== null) setBatteryLevel(parsed);
           }
         );
         listenerRef.current = handle;
 
         setConnectedDevice(device);
         setLog([]);
+        setBatteryLevel(null);
         setAppState("connected");
         setStatusMsg(`Connected to ${device.name || device.address}`);
         addLog("sys", `Connected to ${device.name || device.address}`);
@@ -137,10 +163,24 @@ export default function Home() {
       // ignore
     }
     setConnectedDevice(null);
+    setBatteryLevel(null);
     setAppState("idle");
     setDevices([]);
     setStatusMsg("Disconnected. Tap 'Scan' to connect again.");
     setIsBusy(false);
+  }, [addLog]);
+
+  // ── Request battery level from device ─────────────────────────────
+  // Sends a standard AT command; many Classic BT devices (headsets, modules)
+  // respond with e.g. "+CBC:0,85" or "battery:85".
+  const handleRequestBattery = useCallback(async () => {
+    try {
+      await BluetoothCommunication.sendData({ data: "AT+CBC\r\n" });
+      addLog("tx", "AT+CBC (battery query)");
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      addLog("sys", `Battery request failed: ${msg}`);
+    }
   }, [addLog]);
 
   // ── Key-down on input (Enter to send) ──────────────────────────────
@@ -160,6 +200,25 @@ export default function Home() {
     connected: "text-emerald-400",
     error: "text-red-400",
   };
+
+  /* ─── Battery colour & icon helpers ───────────────────────────── */
+  const batteryBarColor =
+    batteryLevel === null
+      ? "bg-slate-600"
+      : batteryLevel > 50
+      ? "bg-emerald-400"
+      : batteryLevel > 20
+      ? "bg-amber-400"
+      : "bg-red-500";
+
+  const batteryTextColor =
+    batteryLevel === null
+      ? "text-slate-500"
+      : batteryLevel > 50
+      ? "text-emerald-400"
+      : batteryLevel > 20
+      ? "text-amber-400"
+      : "text-red-400";
 
   /* ─── Log entry colour ──────────────────────────────────────────── */
   const logColor = (dir: LogEntry["dir"]) =>
@@ -215,6 +274,41 @@ export default function Home() {
                 <span className="text-xs text-slate-400 font-mono">{d.address}</span>
               </button>
             ))}
+          </div>
+        )}
+
+        {/* ── Battery widget (connected state) ─────────────────────── */}
+        {appState === "connected" && (
+          <div className="rounded-xl bg-slate-700/50 px-4 py-3 flex items-center gap-4 border border-slate-600/50">
+            {/* Battery icon */}
+            <div className="relative flex items-center">
+              {/* Outer shell */}
+              <div className="w-12 h-6 rounded border-2 border-slate-500 relative flex items-center px-0.5">
+                {/* Positive terminal nub */}
+                <div className="absolute -right-[5px] top-1/2 -translate-y-1/2 w-1.5 h-3 rounded-r border border-slate-500 bg-slate-700" />
+                {/* Fill bar */}
+                <div
+                  className={`h-3.5 rounded-sm transition-all duration-500 ${batteryBarColor}`}
+                  style={{ width: batteryLevel !== null ? `${batteryLevel}%` : "0%" }}
+                />
+              </div>
+            </div>
+
+            {/* Text */}
+            <div className="flex-1">
+              <p className="text-xs font-semibold uppercase tracking-widest text-slate-500">Battery</p>
+              <p className={`text-2xl font-black tabular-nums leading-none mt-0.5 ${batteryTextColor}`}>
+                {batteryLevel !== null ? `${batteryLevel}%` : "--"}
+              </p>
+            </div>
+
+            {/* Request button */}
+            <button
+              onClick={handleRequestBattery}
+              className="rounded-lg bg-slate-600 px-3 py-1.5 text-xs font-semibold text-slate-200 hover:bg-slate-500 active:scale-95 transition-all"
+            >
+              Request
+            </button>
           </div>
         )}
 
