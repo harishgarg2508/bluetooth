@@ -223,6 +223,15 @@ const ORANGE_MAIN_WRITE1 = "0000ae01-0000-1000-8000-00805f9b34fb"; // primary wr
 const ORANGE_MAIN_WRITE2 = "0000ae03-0000-1000-8000-00805f9b34fb"; // secondary write
 const ORANGE_MAIN_READ   = "0000ae10-0000-1000-8000-00805f9b34fb"; // readable register
 
+// ── Orange glasses CAMERA event service (f728) ─────────────────────
+// 2 chars confirmed: f72a[W/WNR] f729[N]
+// f729 NOTIFY fires when photo/video/recording is captured on the glasses
+// Packet from capture: BC 73 08 00 82 26 01 1A 00 02 00 00 00 01
+//   bytes[6]=0x01 cmdType=capture, bytes[9]=mediaType(02=img?), bytes[13]=count
+const ORANGE_CAMERA_SVC    = "0000f728-0000-1000-8000-00805f9b34fb";
+const ORANGE_CAMERA_NOTIFY = "0000f729-0000-1000-8000-00805f9b34fb";
+const ORANGE_CAMERA_WRITE  = "0000f72a-0000-1000-8000-00805f9b34fb";
+
 /** Parse an incoming BLE notification into a typed result — pure function. */
 function parseBleDataView(
   bytes: Uint8Array,
@@ -230,10 +239,20 @@ function parseBleDataView(
   chrUuid: string,
 ): | { type: "battery"; level: number; charging: boolean }
    | { type: "media"; images: number; videos: number; recordings: number }
+   | { type: "capture"; mediaType: "image" | "video" | "recording" | "unknown"; rawBytes: string }
    | { type: "raw"; hex: string; chrId: string } {
   // Standard BLE Battery Service → single byte 0–100
   if (svcUuid.startsWith("0000180f") && chrUuid.startsWith("00002a19")) {
     return { type: "battery", level: bytes[0] ?? 0, charging: false };
+  }
+  // Orange camera capture event — cmdType 0x01 on f729
+  // Fired when user presses shutter on glasses
+  if (chrUuid.startsWith("0000f729") && bytes.length >= 7 && bytes[6] === 0x01) {
+    const raw = Array.from(bytes).map((b) => b.toString(16).padStart(2,"0").toUpperCase()).join(" ");
+    const mtype = bytes.length >= 10
+      ? (bytes[9] === 0x02 ? "image" : bytes[9] === 0x03 ? "video" : bytes[9] === 0x04 ? "recording" : "unknown")
+      : "unknown";
+    return { type: "capture", mediaType: mtype as "image"|"video"|"recording"|"unknown", rawBytes: raw };
   }
   // Orange SDK: battery report — cmdType 0x05 at loadData[6]
   if (bytes.length >= 9 && bytes[6] === 0x05) {
@@ -467,6 +486,16 @@ export default function Home() {
                 setMediaCounts({ images: result.images, videos: result.videos, recordings: result.recordings });
                 setIsCheckingMedia(false);
                 addLog("sys", `  → media: ${result.images} img · ${result.videos} vid · ${result.recordings} rec`);
+              } else if (result.type === "capture") {
+                // Glasses shutter pressed — auto-increment local media count
+                addLog("sys", `  → CAPTURE: ${result.mediaType} (raw: ${result.rawBytes})`);
+                setMediaCounts((prev) => {
+                  const base = prev ?? { images: 0, videos: 0, recordings: 0 };
+                  if (result.mediaType === "image")     return { ...base, images: base.images + 1 };
+                  if (result.mediaType === "video")     return { ...base, videos: base.videos + 1 };
+                  if (result.mediaType === "recording") return { ...base, recordings: base.recordings + 1 };
+                  return { ...base, images: base.images + 1 }; // unknown → assume image
+                });
               } else {
                 addLog("sys", `  → raw (no parse match)${isNusTx ? " [NUS-TX]" : ""}`);
               }
