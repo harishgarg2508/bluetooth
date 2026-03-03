@@ -230,7 +230,17 @@ const ORANGE_MAIN_READ   = "0000ae10-0000-1000-8000-00805f9b34fb"; // readable r
 //   bytes[6]=0x01 cmdType=capture, bytes[9]=mediaType(02=img?), bytes[13]=count
 const ORANGE_CAMERA_SVC    = "0000f728-0000-1000-8000-00805f9b34fb";
 const ORANGE_CAMERA_NOTIFY = "0000f729-0000-1000-8000-00805f9b34fb";
-const ORANGE_CAMERA_WRITE  = "0000f72a-0000-1000-8000-00805f9b34fb";
+const ORANGE_CAMERA_WRITE  = "0000f72a-0000-1000-8000-00805f9b34fb"; // write → f728 svc
+
+// ── Orange glasses ae3a service ─────────────────────────────────────
+// ae3b[WNR] = write channel, ae3c[N] = notify
+const ORANGE_AE3A_SVC   = "0000ae3a-0000-1000-8000-00805f9b34fb";
+const ORANGE_AE3B_WRITE = "0000ae3b-0000-1000-8000-00805f9b34fb";
+
+// BC 73 protocol — battery REQUEST frame (mimics device's push format)
+// Device pushes: BC 73 03 00 [2-byte counter] 05 [level] [charging]
+// We try querying by sending the same framing with zeros for data fields
+const BC73_BAT_REQUEST = new Uint8Array([0xBC, 0x73, 0x03, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00]);
 
 /** Parse an incoming BLE notification into a typed result — pure function. */
 function parseBleDataView(
@@ -432,15 +442,29 @@ export default function Home() {
           const bytes = new Uint8Array(dv.buffer);
           const hex = Array.from(bytes).map((b) => b.toString(16).padStart(2,"0").toUpperCase()).join(" ");
           addLog("sys", `ae10 READ (${bytes.length}B): ${hex}`);
-          if (bytes.length === 1) {
+          if (bytes.length >= 1 && bytes[0] > 0 && bytes[0] <= 100) {
             setBatteryLevel(bytes[0]);
             addLog("sys", `→ battery from ae10: ${bytes[0]}%`);
           } else if (bytes.length >= 2) {
-            addLog("sys", `ae10[0]=${bytes[0]} ae10[1]=${bytes[1]} (check hex for battery value)`);
+            addLog("sys", `ae10[0]=${bytes[0]} ae10[1]=${bytes[1]} (raw)`);
+          } else {
+            addLog("sys", "ae10 empty — probing via f72a BC73");
           }
         } catch (e) {
           addLog("sys", `ae10 read err: ${e instanceof Error ? e.message : String(e)}`);
         }
+        // Probe f72a with BC73 battery request (triggers f729 notification)
+        try {
+          await BleClient.writeWithoutResponse(address, ORANGE_CAMERA_SVC, ORANGE_CAMERA_WRITE,
+            new DataView(BC73_BAT_REQUEST.buffer));
+          addLog("sys", "→ BC73 bat-request sent to f72a (watch f729 for response)");
+        } catch { /* f72a probe silent fail */ }
+        // Also probe ae3b
+        try {
+          await BleClient.writeWithoutResponse(address, ORANGE_AE3A_SVC, ORANGE_AE3B_WRITE,
+            new DataView(BC73_BAT_REQUEST.buffer));
+          addLog("sys", "→ BC73 bat-request sent to ae3b");
+        } catch { /* ae3b probe silent fail */ }
       } else if (hasOrangeSvc) {
         setBleWriteSvc(ORANGE_CMD_SVC);
         setBleWriteChar(ORANGE_CMD_WRITE);
@@ -729,17 +753,31 @@ export default function Home() {
           addLog("sys", `write ae03 failed: ${err instanceof Error ? err.message : String(err)}`);
         }
       }
-      // Also re-read ae10 directly (may contain current battery level)
+      // Re-read ae10
       try {
         const dv = await BleClient.read(devId, ORANGE_MAIN_SVC, ORANGE_MAIN_READ);
         const bytes = new Uint8Array(dv.buffer);
         const hex = Array.from(bytes).map((b) => b.toString(16).padStart(2,"0").toUpperCase()).join(" ");
         addLog("sys", `ae10 re-read (${bytes.length}B): ${hex}`);
-        if (bytes.length >= 1 && bytes[0] <= 100) {
+        if (bytes.length >= 1 && bytes[0] > 0 && bytes[0] <= 100) {
           setBatteryLevel(bytes[0]);
           addLog("sys", `→ battery from ae10: ${bytes[0]}%`);
         }
       } catch { /* ae10 not available on this path */ }
+      // Probe f72a with BC73 battery request — device should push battery on f729
+      try {
+        await BleClient.writeWithoutResponse(devId, ORANGE_CAMERA_SVC, ORANGE_CAMERA_WRITE,
+          new DataView(BC73_BAT_REQUEST.buffer));
+        addLog("sys", "→ BC73 [BC 73 03 00 00 00 05 00 00] sent to f72a — waiting for f729 response");
+      } catch (e) {
+        addLog("sys", `f72a probe failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      // Also try ae3b
+      try {
+        await BleClient.writeWithoutResponse(devId, ORANGE_AE3A_SVC, ORANGE_AE3B_WRITE,
+          new DataView(BC73_BAT_REQUEST.buffer));
+        addLog("sys", "→ BC73 bat-request sent to ae3b");
+      } catch { /* silent */ }
       return;
     }
     if (batCmd.trim().length > 0) {
