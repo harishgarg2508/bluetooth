@@ -30,6 +30,12 @@ interface SendProgress {
   total: number;  // total chunks
 }
 
+interface DeviceItem {
+  id: number;
+  name: string;
+  size?: number;
+}
+
 // ── Transfer constants ─────────────────────────────────────────────────
 /** Raw binary bytes per chunk. Base64-encoded each chunk = ceil(512*4/3)=684 chars,
  *  well within RFCOMM MTU (~990 bytes). */
@@ -75,12 +81,80 @@ function formatBytes(n: number): string {
   return `${(n / 1024 / 1024).toFixed(2)} MB`;
 }
 
-// Parse a battery percentage out of any SPP/RFCOMM data string.
-function parseBattery(raw: string): number | null {
-  const s = raw.toLowerCase().trim();
-  const patterns = [
-    /bat(?:tery)?\s*[=:]\s*(\d{1,3})/,
-    /\+cbc:\d+,(\d{1,3})/,
+// Parse device item list from any line-delimited response.
+function parseDeviceItems(raw: string): DeviceItem[] {
+  const items: DeviceItem[] = [];
+  let counter = 0;
+  const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  for (const line of lines) {
+    if (/^FILE_(START|END|ABORT):/i.test(line) || /^CHUNK:/i.test(line)) continue;
+    if (/^FILES:\d+$/i.test(line) || /^\d+$/.test(line)) continue;
+    if (/^(OK|ERROR|AT\+)$/i.test(line)) continue;
+    let m = line.match(/^\d+[:.\s]\s*(.+?\.\w{1,5})[:\s](\d+)$/i);
+    if (m) { items.push({ id: counter++, name: m[1].trim(), size: parseInt(m[2]) }); continue; }
+    m = line.match(/^\d+[:.\s]\s*(.+?\.\w{1,5})$/i);
+    if (m) { items.push({ id: counter++, name: m[1].trim() }); continue; }
+    m = line.match(/^(.+?\.\w{1,5})[:\s](\d+)$/i);
+    if (m) { items.push({ id: counter++, name: m[1].trim(), size: parseInt(m[2]) }); continue; }
+    m = line.match(/^(.+?\.\w{1,5})$/i);
+    if (m) { items.push({ id: counter++, name: m[1].trim() }); continue; }
+  }
+  return items;
+}
+
+// Determine whether received data is binary (contains non-printable bytes)
+function isBinaryData(raw: string): boolean {
+  for (let i = 0; i < Math.min(raw.length, 32); i++) {
+    const c = raw.charCodeAt(i);
+    // control chars other than \r \n \t indicate binary
+    if (c < 0x20 && c !== 0x09 && c !== 0x0a && c !== 0x0d) return true;
+  }
+  return false;
+}
+
+// Convert string of raw bytes to readable hex string for debug display
+function toHexDump(raw: string, maxBytes = 24): string {
+  const bytes = Math.min(raw.length, maxBytes);
+  let out = "";
+  for (let i = 0; i < bytes; i++) {
+    out += raw.charCodeAt(i).toString(16).padStart(2, "0").toUpperCase() + " ";
+  }
+  if (raw.length > maxBytes) out += "...";
+  return out.trim();
+}
+
+// Parse battery from BINARY packet (glasses SDK binary protocol):
+//   loadData[6] = 0x03 → battery packet
+//   loadData[7] = battery level (0–100)
+//   loadData[8] = charging status (0=no, non-zero=yes)
+function parseBatteryBinary(raw: string): { level: number; charging: boolean } | null {
+  // Primary: packet with 6-byte header (SDK: loadData[6] = cmdType)
+  if (raw.length >= 9 && raw.charCodeAt(6) === 0x03) {
+    const level = raw.charCodeAt(7);
+    const charging = raw.charCodeAt(8) !== 0;
+    if (level >= 0 && level <= 100) return { level, charging };
+  }
+  // Fallback: scan for 0x03 command byte anywhere in packet
+  // (handles variable-length headers)
+  for (let i = 0; i < raw.length - 2; i++) {
+    if (raw.charCodeAt(i) === 0x03) {
+      const level = raw.charCodeAt(i + 1);
+      const charging = raw.charCodeAt(i + 2) !== 0;
+      if (level > 0 && level <= 100) return { level, charging };
+    }
+  }
+  return null;
+}
+
+// Parse battery % from any SPP/RFCOMM TEXT string — intentionally broad.
+function parseBatteryText(raw: string): number | null {
+  const s = raw.trim();
+  const patterns: RegExp[] = [
+    /bat(?:tery)?\s*[=:]\s*(\d{1,3})/i,
+    /\+cbc:\d+,(\d{1,3})/i,
+    /power\s*[=:]\s*(\d{1,3})/i,
+    /charge\s*[=:]\s*(\d{1,3})/i,
+    /level\s*[=:]\s*(\d{1,3})/i,
     /(\d{1,3})\s*%/,
     /^(\d{1,3})$/,
   ];
@@ -94,6 +168,15 @@ function parseBattery(raw: string): number | null {
   return null;
 }
 
+// Unified parser — tries binary first, falls back to text
+function parseBattery(raw: string): { level: number; charging: boolean } | null {
+  const bin = parseBatteryBinary(raw);
+  if (bin) return bin;
+  const txt = parseBatteryText(raw);
+  if (txt !== null) return { level: txt, charging: false };
+  return null;
+}
+
 export default function Home() {
   const [appState, setAppState] = useState<AppState>("idle");
   const [statusMsg, setStatusMsg] = useState("Tap 'Scan' to find paired devices.");
@@ -103,16 +186,31 @@ export default function Home() {
   const [inputText, setInputText] = useState("");
   const [isBusy, setIsBusy] = useState(false);
   const [batteryLevel, setBatteryLevel] = useState<number | null>(null);
-  const [activeTab, setActiveTab] = useState<"terminal" | "files">("terminal");
+  const [isCharging, setIsCharging] = useState(false);
+  const [activeTab, setActiveTab] = useState<"terminal" | "files" | "import">("terminal");
   const [receivedFiles, setReceivedFiles] = useState<ReceivedFile[]>([]);
   const [sendProgress, setSendProgress] = useState<SendProgress | null>(null);
   const [isSending, setIsSending] = useState(false);
+  // Battery helpers
+  const [lastRxLine, setLastRxLine] = useState("");
+  const [batCmd, setBatCmd] = useState("AT+CBC\r\n");
+  const [showBatCmdEdit, setShowBatCmdEdit] = useState(false);
+  const [manualBatInput, setManualBatInput] = useState("");
+  // Import 
+  const [deviceItems, setDeviceItems] = useState<DeviceItem[]>([]);
+  const [isListing, setIsListing] = useState(false);
+  const [listCmd, setListCmd] = useState("LIST\r\n");
+  const [getCmd, setGetCmd] = useState("GET:");
+  const [importingItem, setImportingItem] = useState<string | null>(null);
   const logEndRef = useRef<HTMLDivElement>(null);
   const listenerRef = useRef<{ remove: () => void } | null>(null);
   const rxBufferRef = useRef<string>("");
   const abortSendRef = useRef<boolean>(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const receivedFilesRef = useRef<ReceivedFile[]>([]);
+  const listBufferRef = useRef<string>("");
+  const listTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isListingRef = useRef<boolean>(false);
 
   const addLog = useCallback((dir: LogEntry["dir"], text: string) => {
     setLog((prev) => [...prev, { id: logCounter++, dir, text }]);
@@ -168,6 +266,9 @@ export default function Home() {
         const newFile: ReceivedFile = { id: fileIdCounter++, name: rawName, originalSize, url, mime };
         receivedFilesRef.current = [...receivedFilesRef.current, newFile];
         setReceivedFiles([...receivedFilesRef.current]);
+        // Auto-clear import spinner + switch to files tab
+        setImportingItem((prev) => (prev === rawName ? null : prev));
+        setActiveTab("files");
         addLog("sys", `✓ File received: ${rawName} (${formatBytes(originalSize)})`);
       } catch {
         addLog("sys", `✗ Failed to decode: ${rawName}`);
@@ -223,12 +324,37 @@ export default function Home() {
         const handle = await BluetoothCommunication.addListener(
           "dataReceived",
           (event: { data: string }) => {
-            addLog("rx", event.data);
-            const parsed = parseBattery(event.data);
-            if (parsed !== null) setBatteryLevel(parsed);
-            // Accumulate in buffer and scan for complete file frames
-            rxBufferRef.current += event.data;
+            const data = event.data;
+            addLog("rx", data);
+            // Show first non-empty line (or hex dump if binary) as last device response
+            if (isBinaryData(data)) {
+              setLastRxLine("[bin] " + toHexDump(data));
+            } else {
+              const firstLine = data.split(/\r?\n/)[0].trim().slice(0, 80);
+              if (firstLine) setLastRxLine(firstLine);
+            }
+            // Auto-parse battery (binary or text protocol)
+            const parsed = parseBattery(data);
+            if (parsed !== null) {
+              setBatteryLevel(parsed.level);
+              setIsCharging(parsed.charging);
+            }
+            // File frame assembly
+            rxBufferRef.current += data;
             processBuffer();
+            // Listing mode: accumulate lines and debounce-finalize after 800 ms silence
+            if (isListingRef.current) {
+              listBufferRef.current += data;
+              if (listTimeoutRef.current) clearTimeout(listTimeoutRef.current);
+              listTimeoutRef.current = setTimeout(() => {
+                isListingRef.current = false;
+                setIsListing(false);
+                const items = parseDeviceItems(listBufferRef.current);
+                setDeviceItems(items);
+                listBufferRef.current = "";
+                addLog("sys", `Device list: ${items.length} item(s) found.`);
+              }, 800);
+            }
           }
         );
         listenerRef.current = handle;
@@ -236,9 +362,15 @@ export default function Home() {
         setConnectedDevice(device);
         setLog([]);
         setBatteryLevel(null);
+        setIsCharging(false);
+        setLastRxLine("");
         rxBufferRef.current = "";
         receivedFilesRef.current = [];
         setReceivedFiles([]);
+        setDeviceItems([]);
+        setImportingItem(null);
+        isListingRef.current = false;
+        listBufferRef.current = "";
         setActiveTab("terminal");
         setAppState("connected");
         setStatusMsg(`Connected to ${device.name || device.address}`);
@@ -283,12 +415,20 @@ export default function Home() {
     receivedFilesRef.current.forEach((f) => URL.revokeObjectURL(f.url));
     receivedFilesRef.current = [];
     rxBufferRef.current = "";
+    listBufferRef.current = "";
+    if (listTimeoutRef.current) clearTimeout(listTimeoutRef.current);
+    isListingRef.current = false;
     abortSendRef.current = true;
     setReceivedFiles([]);
     setSendProgress(null);
     setIsSending(false);
+    setDeviceItems([]);
+    setIsListing(false);
+    setImportingItem(null);
+    setLastRxLine("");
     setConnectedDevice(null);
     setBatteryLevel(null);
+    setIsCharging(false);
     setAppState("idle");
     setDevices([]);
     setStatusMsg("Disconnected. Tap 'Scan' to connect again.");
@@ -296,17 +436,15 @@ export default function Home() {
   }, [addLog]);
 
   // ── Request battery level from device ─────────────────────────────
-  // Sends a standard AT command; many Classic BT devices (headsets, modules)
-  // respond with e.g. "+CBC:0,85" or "battery:85".
   const handleRequestBattery = useCallback(async () => {
     try {
-      await BluetoothCommunication.sendData({ data: "AT+CBC\r\n" });
-      addLog("tx", "AT+CBC (battery query)");
+      const cmd = batCmd.replace(/\\r/g, "\r").replace(/\\n/g, "\n");
+      await BluetoothCommunication.sendData({ data: cmd });
+      addLog("tx", `Battery query: ${JSON.stringify(batCmd.trim())}`);
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      addLog("sys", `Battery request failed: ${msg}`);
+      addLog("sys", `Battery request failed: ${err instanceof Error ? err.message : String(err)}`);
     }
-  }, [addLog]);
+  }, [addLog, batCmd]);
 
   // ── Send a file over RFCOMM (base64-chunked framing protocol) ─────
   const handleFileChange = useCallback(
@@ -363,6 +501,38 @@ export default function Home() {
 
   const triggerFilePick  = useCallback(() => fileInputRef.current?.click(), []);
   const handleAbortSend  = useCallback(() => { abortSendRef.current = true; }, []);
+
+  // ── List files on the remote device ───────────────────────────────
+  const handleListFiles = useCallback(async () => {
+    isListingRef.current = true;
+    listBufferRef.current = "";
+    setIsListing(true);
+    setDeviceItems([]);
+    try {
+      const cmd = listCmd.replace(/\\r/g, "\r").replace(/\\n/g, "\n");
+      await BluetoothCommunication.sendData({ data: cmd });
+      addLog("tx", `List command: ${JSON.stringify(listCmd.trim())}`);
+    } catch (err: unknown) {
+      isListingRef.current = false;
+      setIsListing(false);
+      addLog("sys", `List failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }, [listCmd, addLog]);
+
+  // ── Request a single file from the device ─────────────────────────
+  const handleImportItem = useCallback(async (itemName: string) => {
+    setImportingItem(itemName);
+    try {
+      const prefix = getCmd.replace(/\\r/g, "\r").replace(/\\n/g, "\n");
+      await BluetoothCommunication.sendData({ data: `${prefix}${itemName}\r\n` });
+      addLog("tx", `Import request: ${getCmd}${itemName}`);
+      // Safety: clear spinner after 30 s if file never arrives
+      setTimeout(() => setImportingItem((prev) => (prev === itemName ? null : prev)), 30000);
+    } catch (err: unknown) {
+      setImportingItem(null);
+      addLog("sys", `Import failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }, [getCmd, addLog]);
 
   // ── Key-down on input (Enter to send) ──────────────────────────────
   const handleKeyDown = useCallback(
@@ -453,31 +623,98 @@ export default function Home() {
         {appState === "connected" && (
           <>
             {/* ── Battery widget ─────────────────────────────────── */}
-            <div className="rounded-xl bg-slate-700/50 px-4 py-3 flex items-center gap-4 border border-slate-600/50">
-              <div className="w-12 h-6 rounded border-2 border-slate-500 relative flex items-center px-0.5 shrink-0">
-                <div className="absolute -right-[5px] top-1/2 -translate-y-1/2 w-1.5 h-3 rounded-r border border-slate-500 bg-slate-700" />
-                <div
-                  className={`h-3.5 rounded-sm transition-all duration-500 ${batteryBarColor}`}
-                  style={{ width: batteryLevel !== null ? `${batteryLevel}%` : "0%" }}
-                />
+            <div className="rounded-xl bg-slate-700/50 border border-slate-600/50 overflow-hidden">
+              {/* Main row */}
+              <div className="px-4 py-3 flex items-center gap-4">
+                <div className="w-12 h-6 rounded border-2 border-slate-500 relative flex items-center px-0.5 shrink-0">
+                  <div className="absolute -right-[5px] top-1/2 -translate-y-1/2 w-1.5 h-3 rounded-r border border-slate-500 bg-slate-700" />
+                  <div
+                    className={`h-3.5 rounded-sm transition-all duration-500 ${batteryBarColor}`}
+                    style={{ width: batteryLevel !== null ? `${batteryLevel}%` : "0%" }}
+                  />
+                  {isCharging && (
+                    <span className="absolute inset-0 flex items-center justify-center text-[9px] leading-none text-white font-bold select-none">
+                      &#9889;
+                    </span>
+                  )}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className="text-xs font-semibold uppercase tracking-widest text-slate-500">
+                    Battery{isCharging && <span className="ml-1.5 text-yellow-400 font-bold">&#9889; Charging</span>}
+                  </p>
+                  <p className={`text-2xl font-black tabular-nums leading-none mt-0.5 ${batteryTextColor}`}>
+                    {batteryLevel !== null ? `${batteryLevel}%` : "--"}
+                  </p>
+                  {lastRxLine && (
+                    <p
+                      className={`text-[10px] mt-0.5 truncate font-mono ${
+                        lastRxLine.startsWith("[bin]") ? "text-amber-400/70" : "text-slate-500"
+                      }`}
+                      title={lastRxLine}
+                    >
+                      {lastRxLine.startsWith("[bin]") ? lastRxLine : `\u21A9 ${lastRxLine}`}
+                    </p>
+                  )}
+                </div>
+                <div className="flex flex-col items-end gap-1 shrink-0">
+                  <button
+                    onClick={handleRequestBattery}
+                    className="rounded-lg bg-slate-600 px-3 py-1.5 text-xs font-semibold text-slate-200 hover:bg-slate-500 active:scale-95 transition-all"
+                  >
+                    Request
+                  </button>
+                  <button
+                    onClick={() => setShowBatCmdEdit((v) => !v)}
+                    className="text-[10px] text-slate-500 hover:text-slate-300 transition-colors"
+                  >
+                    {showBatCmdEdit ? "▲ hide" : "▼ set cmd"}
+                  </button>
+                </div>
               </div>
-              <div className="flex-1">
-                <p className="text-xs font-semibold uppercase tracking-widest text-slate-500">Battery</p>
-                <p className={`text-2xl font-black tabular-nums leading-none mt-0.5 ${batteryTextColor}`}>
-                  {batteryLevel !== null ? `${batteryLevel}%` : "--"}
-                </p>
-              </div>
-              <button
-                onClick={handleRequestBattery}
-                className="rounded-lg bg-slate-600 px-3 py-1.5 text-xs font-semibold text-slate-200 hover:bg-slate-500 active:scale-95 transition-all"
-              >
-                Request
-              </button>
+              {/* Collapsible command + manual-set row */}
+              {showBatCmdEdit && (
+                <div className="border-t border-slate-600/40 px-3 py-2.5 flex flex-col gap-2">
+                  <div className="flex gap-2 items-center">
+                    <span className="text-[10px] text-slate-500 w-16 shrink-0">Bat cmd:</span>
+                    <input
+                      value={batCmd}
+                      onChange={(e) => setBatCmd(e.target.value)}
+                      placeholder="AT+CBC\r\n"
+                      className="flex-1 rounded-lg bg-slate-900 px-2 py-1 text-xs text-white font-mono placeholder-slate-600 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    />
+                    <button
+                      onClick={() => setBatCmd("AT+CBC\r\n")}
+                      className="text-[10px] text-slate-500 hover:text-slate-300 transition-colors"
+                    >
+                      Reset
+                    </button>
+                  </div>
+                  <div className="flex gap-2 items-center">
+                    <span className="text-[10px] text-slate-500 w-16 shrink-0">Set manually:</span>
+                    <input
+                      type="number" min={0} max={100}
+                      value={manualBatInput}
+                      onChange={(e) => setManualBatInput(e.target.value)}
+                      placeholder="0–100"
+                      className="w-16 rounded-lg bg-slate-900 px-2 py-1 text-xs text-white text-center focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    />
+                    <button
+                      onClick={() => {
+                        const v = parseInt(manualBatInput, 10);
+                        if (!isNaN(v) && v >= 0 && v <= 100) { setBatteryLevel(v); setManualBatInput(""); }
+                      }}
+                      className="rounded-lg bg-slate-600 px-3 py-1 text-[10px] font-semibold text-white hover:bg-slate-500"
+                    >
+                      Set
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* ── Tab bar ────────────────────────────────────────── */}
             <div className="flex rounded-xl bg-slate-900/60 p-1 gap-1">
-              {(["terminal", "files"] as const).map((tab) => (
+              {(["terminal", "files", "import"] as const).map((tab) => (
                 <button
                   key={tab}
                   onClick={() => setActiveTab(tab)}
@@ -490,8 +727,13 @@ export default function Home() {
                 >
                   {tab}
                   {tab === "files" && receivedFiles.length > 0 && (
-                    <span className="ml-1.5 rounded-full bg-blue-500 px-1.5 py-0.5 text-[10px] font-bold text-white">
+                    <span className="ml-1 rounded-full bg-blue-500 px-1.5 py-0.5 text-[10px] font-bold text-white">
                       {receivedFiles.length}
+                    </span>
+                  )}
+                  {tab === "import" && deviceItems.length > 0 && (
+                    <span className="ml-1 rounded-full bg-violet-500 px-1.5 py-0.5 text-[10px] font-bold text-white">
+                      {deviceItems.length}
                     </span>
                   )}
                 </button>
@@ -617,6 +859,110 @@ export default function Home() {
                           >
                             Save
                           </a>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+              </div>
+            )}
+
+            {/* ── Import tab ─────────────────────────────────────── */}
+            {activeTab === "import" && (
+              <div className="flex flex-col gap-3">
+
+                {/* Command config */}
+                <div className="rounded-xl bg-slate-700/50 border border-slate-600/50 px-4 py-3 flex flex-col gap-2">
+                  <p className="text-xs font-semibold uppercase tracking-widest text-slate-400">Device Commands</p>
+                  <div className="flex gap-2 items-center">
+                    <span className="text-[10px] text-slate-500 w-16 shrink-0">List cmd:</span>
+                    <input
+                      value={listCmd}
+                      onChange={(e) => setListCmd(e.target.value)}
+                      placeholder="LIST\r\n"
+                      className="flex-1 rounded-lg bg-slate-900 px-2 py-1 text-xs text-white font-mono placeholder-slate-600 focus:outline-none focus:ring-1 focus:ring-violet-500"
+                    />
+                  </div>
+                  <div className="flex gap-2 items-center">
+                    <span className="text-[10px] text-slate-500 w-16 shrink-0">Get prefix:</span>
+                    <input
+                      value={getCmd}
+                      onChange={(e) => setGetCmd(e.target.value)}
+                      placeholder="GET:"
+                      className="flex-1 rounded-lg bg-slate-900 px-2 py-1 text-xs text-white font-mono placeholder-slate-600 focus:outline-none focus:ring-1 focus:ring-violet-500"
+                    />
+                  </div>
+                  <button
+                    onClick={handleListFiles}
+                    disabled={isListing}
+                    className="flex items-center justify-center gap-2 w-full rounded-xl bg-violet-600 py-2.5 text-sm font-semibold text-white hover:bg-violet-500 active:scale-95 transition-all disabled:opacity-60"
+                  >
+                    {isListing ? (
+                      <>
+                        <svg className="h-4 w-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+                        </svg>
+                        Fetching list…
+                      </>
+                    ) : (
+                      "↻ Refresh List"
+                    )}
+                  </button>
+                </div>
+
+                {/* Item list */}
+                <div className="flex flex-col gap-2">
+                  <div className="flex items-center justify-between">
+                    <p className="text-xs font-semibold uppercase tracking-widest text-slate-400">On Device</p>
+                    {deviceItems.length > 0 && (
+                      <span className="rounded-full bg-violet-500/20 border border-violet-500/30 px-2 py-0.5 text-[11px] font-bold text-violet-300">
+                        {deviceItems.length} item{deviceItems.length !== 1 ? "s" : ""}
+                      </span>
+                    )}
+                  </div>
+
+                  {deviceItems.length === 0 ? (
+                    <div className="rounded-xl bg-slate-900/50 border border-slate-700 px-4 py-6 text-center">
+                      <p className="text-slate-500 text-sm">No items listed yet.</p>
+                      <p className="text-slate-600 text-xs mt-1">
+                        Set the List command above and tap
+                        <span className="text-violet-400"> ↻ Refresh List</span>.
+                        <br />The terminal shows raw responses to help find the right command.
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="flex flex-col gap-2 max-h-64 overflow-y-auto">
+                      {deviceItems.map((item) => (
+                        <div
+                          key={item.id}
+                          className="flex items-center gap-3 rounded-xl bg-slate-700/60 border border-slate-600/40 px-3 py-2.5"
+                        >
+                          <span className="text-xl shrink-0">{fileIcon(mimeOf(item.name))}</span>
+                          <div className="flex-1 min-w-0">
+                            <p className="text-sm font-semibold text-white truncate">{item.name}</p>
+                            {item.size !== undefined && (
+                              <p className="text-xs text-slate-400">{formatBytes(item.size)}</p>
+                            )}
+                          </div>
+                          <button
+                            onClick={() => handleImportItem(item.name)}
+                            disabled={importingItem === item.name}
+                            className={`shrink-0 rounded-lg px-3 py-1.5 text-xs font-semibold transition-all active:scale-95
+                              ${
+                                importingItem === item.name
+                                  ? "bg-slate-600 text-slate-400 cursor-wait"
+                                  : "bg-violet-600 text-white hover:bg-violet-500"
+                              }`}
+                          >
+                            {importingItem === item.name ? (
+                              <svg className="h-3.5 w-3.5 animate-spin" fill="none" viewBox="0 0 24 24">
+                                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+                              </svg>
+                            ) : "Import"}
+                          </button>
                         </div>
                       ))}
                     </div>
