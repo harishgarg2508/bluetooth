@@ -1,4 +1,4 @@
-name: Android Debug APK Build
+name: Android Debug APK Build (BT Classic)
 
 on:
   push:
@@ -32,7 +32,7 @@ jobs:
 
       # ── 4. Install dependencies ───────────────────────────────────────
       - name: Install npm dependencies
-        run: npm install
+        run: npm install --legacy-peer-deps
 
       # ── 5. Build Next.js static export → out/ ────────────────────────
       - name: Build Next.js static site
@@ -55,6 +55,6 @@ jobs:
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: ble-poc-debug-apk
+          name: bt-classic-debug-apk
           path: android/app/build/outputs/apk/debug/app-debug.apk
           retention-days: 7

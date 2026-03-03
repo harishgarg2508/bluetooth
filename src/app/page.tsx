@@ -1,194 +1,296 @@
 "use client";
 
-import { useState, useCallback } from "react";
-import { BleClient } from "@capacitor-community/bluetooth-le";
+import { useState, useCallback, useEffect, useRef } from "react";
+import { BluetoothCommunication } from "@yesprasoon/capacitor-bluetooth-communication";
 
-// UUIDs for Battery Service (BLE standard) – full 128-bit form required by the plugin
-const BATTERY_SERVICE = "0000180f-0000-1000-8000-00805f9b34fb";
-const BATTERY_CHARACTERISTIC = "00002a19-0000-1000-8000-00805f9b34fb";
+type AppState = "idle" | "scanning" | "device_list" | "connecting" | "connected" | "error";
 
-type AppStatus =
-  | "idle"
-  | "initializing"
-  | "scanning"
-  | "connecting"
-  | "reading"
-  | "done"
-  | "error";
+interface BtDevice {
+  name: string;
+  address: string;
+}
+
+interface LogEntry {
+  id: number;
+  dir: "rx" | "tx" | "sys";
+  text: string;
+}
+
+let logCounter = 0;
 
 export default function Home() {
-  const [status, setStatus] = useState<AppStatus>("idle");
-  const [statusMessage, setStatusMessage] = useState<string>(
-    "Press the button to scan for BLE devices."
-  );
-  const [batteryLevel, setBatteryLevel] = useState<number | null>(null);
-  const [isLoading, setIsLoading] = useState(false);
+  const [appState, setAppState] = useState<AppState>("idle");
+  const [statusMsg, setStatusMsg] = useState("Tap 'Scan' to find paired devices.");
+  const [devices, setDevices] = useState<BtDevice[]>([]);
+  const [connectedDevice, setConnectedDevice] = useState<BtDevice | null>(null);
+  const [log, setLog] = useState<LogEntry[]>([]);
+  const [inputText, setInputText] = useState("");
+  const [isBusy, setIsBusy] = useState(false);
+  const logEndRef = useRef<HTMLDivElement>(null);
+  const listenerRef = useRef<{ remove: () => void } | null>(null);
 
-  const connectAndReadBattery = useCallback(async () => {
-    setIsLoading(true);
-    setBatteryLevel(null);
-    let deviceId: string | null = null;
+  const addLog = useCallback((dir: LogEntry["dir"], text: string) => {
+    setLog((prev) => [...prev, { id: logCounter++, dir, text }]);
+  }, []);
 
+  // Auto-scroll log to bottom
+  useEffect(() => {
+    logEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [log]);
+
+  // Remove listener on unmount
+  useEffect(() => {
+    return () => {
+      listenerRef.current?.remove();
+    };
+  }, []);
+
+  // ── Scan for paired devices ────────────────────────────────────────
+  const handleScan = useCallback(async () => {
+    setIsBusy(true);
+    setAppState("scanning");
+    setStatusMsg("Initializing Bluetooth...");
     try {
-      // ── Step 1: Initialize BLE ──────────────────────────────────────
-      setStatus("initializing");
-      setStatusMessage("Initializing Bluetooth...");
-      await BleClient.initialize({ androidNeverForLocation: true });
+      await BluetoothCommunication.initialize();
+      await BluetoothCommunication.enableBluetooth();
 
-      // ── Step 2: Scan – show picker filtered to Battery Service ──────
-      setStatus("scanning");
-      setStatusMessage(
-        "Scanning for BLE devices... Put your earbuds in PAIRING MODE so they appear in the list."
-      );
+      setStatusMsg("Scanning for paired devices...");
+      setAppState("scanning");
 
-      const device = await BleClient.requestDevice({
-        // No services filter → show ALL nearby BLE devices in the picker.
-        // BATTERY_SERVICE listed as optional so we can access it after connecting
-        // even if the device didn't advertise it.
-        optionalServices: [BATTERY_SERVICE],
-      });
+      const result = await BluetoothCommunication.scanDevices();
+      const found = result.devices as BtDevice[];
 
-      deviceId = device.deviceId;
-      setStatusMessage(`Device selected: ${device.name ?? device.deviceId}`);
-
-      // ── Step 3: Connect ─────────────────────────────────────────────
-      setStatus("connecting");
-      setStatusMessage(`Connecting to ${device.name ?? device.deviceId}...`);
-
-      await BleClient.connect(deviceId, (lostDeviceId) => {
-        // Unexpected disconnection callback
-        setStatus("error");
-        setStatusMessage(`Disconnected unexpectedly from ${lostDeviceId}.`);
-        setIsLoading(false);
-      });
-
-      setStatusMessage("Connected! Reading Battery Level...");
-
-      // ── Step 4: Read Battery Level characteristic ───────────────────
-      setStatus("reading");
-      const dataView = await BleClient.read(
-        deviceId,
-        BATTERY_SERVICE,
-        BATTERY_CHARACTERISTIC
-      );
-
-      // ── Step 5: Parse the first byte as an unsigned 8-bit integer ───
-      const level = dataView.getUint8(0);
-      setBatteryLevel(level);
-      setStatus("done");
-      setStatusMessage("Battery level read successfully.");
-    } catch (err: unknown) {
-      const message =
-        err instanceof Error ? err.message : "An unknown error occurred.";
-      setStatus("error");
-      setStatusMessage(`Error: ${message}`);
-    } finally {
-      // ── Step 6: Always disconnect cleanly ───────────────────────────
-      if (deviceId) {
-        try {
-          await BleClient.disconnect(deviceId);
-        } catch {
-          // Ignore disconnect errors (device may already be gone)
-        }
+      if (found.length === 0) {
+        setStatusMsg("No paired devices found. Pair your device in Android Settings first.");
+        setAppState("idle");
+      } else {
+        setDevices(found);
+        setStatusMsg(`Found ${found.length} paired device(s). Select one to connect.`);
+        setAppState("device_list");
       }
-      setIsLoading(false);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setStatusMsg(`Error: ${msg}`);
+      setAppState("error");
+    } finally {
+      setIsBusy(false);
     }
   }, []);
 
-  /* ─── Derived UI helpers ─────────────────────────────────────────── */
-  const statusColor: Record<AppStatus, string> = {
-    idle: "text-slate-500",
-    initializing: "text-blue-500",
-    scanning: "text-blue-500",
-    connecting: "text-amber-500",
-    reading: "text-amber-500",
-    done: "text-emerald-600",
-    error: "text-red-500",
+  // ── Connect to a device ────────────────────────────────────────────
+  const handleConnect = useCallback(
+    async (device: BtDevice) => {
+      setIsBusy(true);
+      setAppState("connecting");
+      setStatusMsg(`Connecting to ${device.name || device.address}...`);
+      try {
+        await BluetoothCommunication.connect({ address: device.address });
+
+        // Subscribe to incoming data
+        const handle = await BluetoothCommunication.addListener(
+          "dataReceived",
+          (event: { data: string }) => {
+            addLog("rx", event.data);
+          }
+        );
+        listenerRef.current = handle;
+
+        setConnectedDevice(device);
+        setLog([]);
+        setAppState("connected");
+        setStatusMsg(`Connected to ${device.name || device.address}`);
+        addLog("sys", `Connected to ${device.name || device.address}`);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        setStatusMsg(`Connection failed: ${msg}`);
+        setAppState("device_list");
+      } finally {
+        setIsBusy(false);
+      }
+    },
+    [addLog]
+  );
+
+  // ── Send data ──────────────────────────────────────────────────────
+  const handleSend = useCallback(async () => {
+    if (!inputText.trim()) return;
+    const payload = inputText.trim();
+    setInputText("");
+    try {
+      await BluetoothCommunication.sendData({ data: payload });
+      addLog("tx", payload);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      addLog("sys", `Send failed: ${msg}`);
+    }
+  }, [inputText, addLog]);
+
+  // ── Disconnect ─────────────────────────────────────────────────────
+  const handleDisconnect = useCallback(async () => {
+    setIsBusy(true);
+    try {
+      listenerRef.current?.remove();
+      listenerRef.current = null;
+      await BluetoothCommunication.disconnect();
+      addLog("sys", "Disconnected.");
+    } catch {
+      // ignore
+    }
+    setConnectedDevice(null);
+    setAppState("idle");
+    setDevices([]);
+    setStatusMsg("Disconnected. Tap 'Scan' to connect again.");
+    setIsBusy(false);
+  }, [addLog]);
+
+  // ── Key-down on input (Enter to send) ──────────────────────────────
+  const handleKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLInputElement>) => {
+      if (e.key === "Enter") handleSend();
+    },
+    [handleSend]
+  );
+
+  /* ─── Status colour ─────────────────────────────────────────────── */
+  const stateColor: Record<AppState, string> = {
+    idle: "text-slate-400",
+    scanning: "text-blue-400",
+    device_list: "text-amber-400",
+    connecting: "text-amber-400",
+    connected: "text-emerald-400",
+    error: "text-red-400",
   };
 
-  const batteryColor =
-    batteryLevel === null
-      ? "text-slate-400"
-      : batteryLevel > 50
-      ? "text-emerald-600"
-      : batteryLevel > 20
-      ? "text-amber-500"
-      : "text-red-500";
+  /* ─── Log entry colour ──────────────────────────────────────────── */
+  const logColor = (dir: LogEntry["dir"]) =>
+    dir === "rx"
+      ? "text-emerald-300"
+      : dir === "tx"
+      ? "text-sky-300"
+      : "text-slate-400";
+
+  const logPrefix = (dir: LogEntry["dir"]) =>
+    dir === "rx" ? "RX ← " : dir === "tx" ? "TX → " : "   # ";
 
   return (
-    <div className="flex min-h-screen flex-col items-center justify-center bg-slate-900 p-6">
-      <div className="w-full max-w-sm rounded-2xl bg-slate-800 p-8 shadow-2xl flex flex-col items-center gap-8">
-        {/* Header */}
+    <div className="flex min-h-screen flex-col items-center justify-center bg-slate-900 p-4">
+      <div className="w-full max-w-md rounded-2xl bg-slate-800 p-6 shadow-2xl flex flex-col gap-5">
+
+        {/* ── Header ───────────────────────────────────────────────── */}
         <div className="text-center">
           <h1 className="text-2xl font-bold text-white tracking-tight">
-            BLE Battery Reader
+            BT Classic Terminal
           </h1>
-          <p className="mt-1 text-sm text-slate-400">
-            Connects via Bluetooth Low Energy (BLE) and reads the Battery Service (0x180F).
-            <br />
-            <span className="text-yellow-400">⚠ Earbuds must be in pairing mode to appear.</span>
+          <p className="mt-1 text-xs text-slate-400">
+            Bluetooth Classic (RFCOMM/SPP) · Android only
           </p>
         </div>
 
-        {/* Battery Display */}
-        <div className="flex flex-col items-center gap-1">
-          <span className="text-sm font-medium text-slate-400 uppercase tracking-widest">
-            Battery Level
-          </span>
-          <span className={`text-7xl font-black tabular-nums ${batteryColor}`}>
-            {batteryLevel !== null ? `${batteryLevel}%` : "--"}
-          </span>
-        </div>
-
-        {/* Action Button */}
-        <button
-          onClick={connectAndReadBattery}
-          disabled={isLoading}
-          className={`w-full rounded-xl px-6 py-4 text-base font-semibold text-white transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:ring-offset-slate-800
-            ${
-              isLoading
-                ? "bg-slate-600 cursor-not-allowed"
-                : "bg-blue-600 hover:bg-blue-500 active:scale-95"
-            }`}
-        >
-          {isLoading ? (
-            <span className="flex items-center justify-center gap-2">
-              <svg
-                className="h-5 w-5 animate-spin"
-                fill="none"
-                viewBox="0 0 24 24"
-              >
-                <circle
-                  className="opacity-25"
-                  cx="12"
-                  cy="12"
-                  r="10"
-                  stroke="currentColor"
-                  strokeWidth="4"
-                />
-                <path
-                  className="opacity-75"
-                  fill="currentColor"
-                  d="M4 12a8 8 0 018-8v8H4z"
-                />
-              </svg>
-              Working...
-            </span>
-          ) : (
-            "Connect & Read Battery"
-          )}
-        </button>
-
-        {/* Status Message */}
-        <div className="w-full rounded-lg bg-slate-700/60 px-4 py-3">
-          <p className="text-xs font-semibold uppercase tracking-widest text-slate-500 mb-1">
+        {/* ── Status bar ───────────────────────────────────────────── */}
+        <div className="rounded-lg bg-slate-700/60 px-4 py-2">
+          <p className="text-xs font-semibold uppercase tracking-widest text-slate-500 mb-0.5">
             Status
           </p>
-          <p className={`text-sm font-medium break-words ${statusColor[status]}`}>
-            {statusMessage}
+          <p className={`text-sm font-medium break-words ${stateColor[appState]}`}>
+            {statusMsg}
           </p>
         </div>
+
+        {/* ── Device list ──────────────────────────────────────────── */}
+        {appState === "device_list" && (
+          <div className="flex flex-col gap-2">
+            <p className="text-xs font-semibold uppercase tracking-widest text-slate-500">
+              Paired Devices
+            </p>
+            {devices.map((d) => (
+              <button
+                key={d.address}
+                onClick={() => handleConnect(d)}
+                disabled={isBusy}
+                className="flex items-center justify-between rounded-xl bg-slate-700 px-4 py-3 text-left hover:bg-slate-600 active:scale-[0.98] transition-all disabled:opacity-50"
+              >
+                <span className="text-sm font-semibold text-white">
+                  {d.name || "(unknown)"}
+                </span>
+                <span className="text-xs text-slate-400 font-mono">{d.address}</span>
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* ── Terminal log (connected state) ───────────────────────── */}
+        {appState === "connected" && (
+          <div className="flex flex-col gap-3">
+            {/* Log window */}
+            <div className="h-52 overflow-y-auto rounded-xl bg-slate-900 px-3 py-2 font-mono text-xs space-y-0.5 border border-slate-700">
+              {log.length === 0 && (
+                <p className="text-slate-600 italic">No data yet…</p>
+              )}
+              {log.map((entry) => (
+                <p key={entry.id} className={logColor(entry.dir)}>
+                  <span className="text-slate-600">{logPrefix(entry.dir)}</span>
+                  {entry.text}
+                </p>
+              ))}
+              <div ref={logEndRef} />
+            </div>
+
+            {/* Send input */}
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={inputText}
+                onChange={(e) => setInputText(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder="Type a message…"
+                className="flex-1 rounded-xl bg-slate-700 px-4 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+              <button
+                onClick={handleSend}
+                disabled={!inputText.trim()}
+                className="rounded-xl bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              >
+                Send
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* ── Action buttons ────────────────────────────────────────── */}
+        <div className="flex flex-col gap-2">
+          {appState !== "connected" && (
+            <button
+              onClick={handleScan}
+              disabled={isBusy || appState === "scanning" || appState === "connecting"}
+              className={`w-full rounded-xl px-6 py-3 text-sm font-semibold text-white transition-all
+                ${isBusy || appState === "scanning" || appState === "connecting"
+                  ? "bg-slate-600 cursor-not-allowed"
+                  : "bg-blue-600 hover:bg-blue-500 active:scale-95"
+                }`}
+            >
+              {appState === "scanning"
+                ? "Scanning…"
+                : appState === "connecting"
+                ? "Connecting…"
+                : appState === "device_list"
+                ? "Rescan"
+                : "Scan for Devices"}
+            </button>
+          )}
+
+          {appState === "connected" && (
+            <button
+              onClick={handleDisconnect}
+              disabled={isBusy}
+              className="w-full rounded-xl bg-red-600 px-6 py-3 text-sm font-semibold text-white hover:bg-red-500 active:scale-95 transition-all disabled:opacity-50"
+            >
+              Disconnect
+            </button>
+          )}
+        </div>
+
       </div>
     </div>
   );
 }
+
