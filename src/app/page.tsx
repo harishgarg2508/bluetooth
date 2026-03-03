@@ -376,9 +376,23 @@ export default function Home() {
 
       const services = await BleClient.getServices(address);
       setBleServices(services);
-
-      // ── Set write channel (NUS RX char) ─────────────────────────────
+      addLog("sys", `── ${services.length} service(s) discovered ──`);
+      for (const svc of services) {
+        const chars = svc.characteristics ?? [];
+        const charSummary = chars.map((c) => {
+          const props = [
+            c.properties.read            ? "R" : "",
+            c.properties.write           ? "W" : "",
+            c.properties.writeWithoutResponse ? "WNR" : "",
+            c.properties.notify          ? "N" : "",
+            c.properties.indicate        ? "I" : "",
+          ].filter(Boolean).join("/");
+          return `  char ${c.uuid.slice(4,8)} [${props}]`;
+        }).join("\n");
+        addLog("sys", `svc ${svc.uuid.slice(4,8)} (${chars.length} char):\n${charSummary || "  (none)"}`);
+      }
       const hasOrangeSvc = services.some((s) => s.uuid === ORANGE_CMD_SVC);
+      addLog("sys", `NUS svc present: ${hasOrangeSvc}`);
       if (hasOrangeSvc) {
         setBleWriteSvc(ORANGE_CMD_SVC);
         setBleWriteChar(ORANGE_CMD_WRITE);
@@ -390,8 +404,12 @@ export default function Home() {
       // ── Subscribe to ALL notify/indicate chars across every service ──
       // (battery comes from a proprietary service, not just NUS)
       const SKIP_SVCS = ["00001800", "00001801", "0000180a"];
+      addLog("sys", "── subscribing to notify chars ──");
       for (const svc of services) {
-        if (SKIP_SVCS.some((p) => svc.uuid.startsWith(p))) continue;
+        if (SKIP_SVCS.some((p) => svc.uuid.startsWith(p))) {
+          addLog("sys", `  skip svc ${svc.uuid.slice(4,8)} (standard/info)`);
+          continue;
+        }
         for (const chr of svc.characteristics ?? []) {
           if (!chr.properties.notify && !chr.properties.indicate) continue;
           try {
@@ -402,22 +420,33 @@ export default function Home() {
               const bytes = new Uint8Array(dv.buffer);
               const hex = Array.from(bytes)
                 .map((b) => b.toString(16).padStart(2, "0").toUpperCase()).join(" ");
-              // Always log raw bytes so we can see what the glasses actually send
-              addLog("sys", `BLE [${capChr.slice(4,8)}]: ${hex}`);
-              // Parse typed result
+              addLog("sys", `RX svc=${capSvc.slice(4,8)} chr=${capChr.slice(4,8)} len=${bytes.length}: ${hex}`);
+              // Show which parse branch was hit
+              const isBattSvc = capSvc.startsWith("0000180f") && capChr.startsWith("00002a19");
+              const isOrangeBatt = bytes.length >= 9 && bytes[6] === 0x05;
+              const isOrangeMedia = bytes.length >= 10 && bytes[6] === 0x04;
+              addLog("sys",
+                `  parse: battSvc=${isBattSvc} orangeBatt=${isOrangeBatt} orangeMedia=${isOrangeMedia}` +
+                (bytes.length >= 7 ? ` b[6]=0x${bytes[6].toString(16).padStart(2,"0")}` : "") +
+                (bytes.length >= 8 ? ` b[7]=0x${bytes[7].toString(16).padStart(2,"0")}` : "")
+              );
               const result = parseBleDataView(bytes, capSvc, capChr);
               if (result.type === "battery") {
                 setBatteryLevel(result.level);
                 setIsCharging(result.charging);
+                addLog("sys", `  → battery ${result.level}% charging=${result.charging}`);
               } else if (result.type === "media") {
                 setMediaCounts({ images: result.images, videos: result.videos, recordings: result.recordings });
                 setIsCheckingMedia(false);
-                addLog("sys", `✓ Media: ${result.images} img · ${result.videos} vid · ${result.recordings} rec`);
-              } else if (!isNusTx) {
-                // non-NUS raw — already logged above, nothing extra needed
+                addLog("sys", `  → media: ${result.images} img · ${result.videos} vid · ${result.recordings} rec`);
+              } else {
+                addLog("sys", `  → raw (no parse match)${isNusTx ? " [NUS-TX]" : ""}`);
               }
             });
-          } catch { /* char not subscribable — skip */ }
+            addLog("sys", `  subscribed ch ${chr.uuid.slice(4,8)} on svc ${svc.uuid.slice(4,8)}`);
+          } catch (subErr) {
+            addLog("sys", `  FAILED subscribe ch ${chr.uuid.slice(4,8)}: ${subErr instanceof Error ? subErr.message : String(subErr)}`);
+          }
         }
       }
 
@@ -617,6 +646,10 @@ export default function Home() {
   // BLE path (correct): write [0x02, 0x05] → syncBattery() via GATT.
   // Fallback: custom AT text command over Classic BT if user provides one.
   const handleRequestBattery = useCallback(async () => {
+    addLog("sys",
+      `[REQ-BAT] bleConnected=${bleConnected} devId=${bleDeviceIdRef.current ?? "null"}` +
+      ` writeSvc=${bleWriteSvc?.slice(4,8) ?? "null"} writeChar=${bleWriteChar?.slice(4,8) ?? "null"}`
+    );
     if (bleConnected && bleDeviceIdRef.current && bleWriteSvc && bleWriteChar) {
       try {
         const dv = new DataView(new Uint8Array([0x02, 0x05]).buffer);
@@ -642,6 +675,10 @@ export default function Home() {
 
   // ── Check un-synced media count via BLE glassesControl([0x02, 0x04]) ──
   const handleCheckMedia = useCallback(async () => {
+    addLog("sys",
+      `[CHK-MEDIA] bleConnected=${bleConnected} devId=${bleDeviceIdRef.current ?? "null"}` +
+      ` writeSvc=${bleWriteSvc?.slice(4,8) ?? "null"} writeChar=${bleWriteChar?.slice(4,8) ?? "null"}`
+    );
     if (!bleConnected || !bleDeviceIdRef.current) {
       addLog("sys", "BLE not connected — cannot check media count (needs BLE GATT).");
       return;
