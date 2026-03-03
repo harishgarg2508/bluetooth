@@ -296,6 +296,7 @@ export default function Home() {
   // Media counts (from binary glassesControl [0x02, 0x04] response)
   const [mediaCounts, setMediaCounts] = useState<MediaCounts | null>(null);
   const [isCheckingMedia, setIsCheckingMedia] = useState(false);
+  const [logExpanded, setLogExpanded] = useState(false);
   // BLE state — battery + media count come via BLE GATT (Orange SDK uses BLE, not RFCOMM)
   const [bleConnected, setBleConnected] = useState(false);
   const [bleStatus, setBleStatus] = useState<"idle" | "connecting" | "connected" | "error">("idle");
@@ -1108,6 +1109,21 @@ export default function Home() {
             {/* ── Terminal tab ───────────────────────────────────── */}
             {activeTab === "terminal" && (
               <div className="flex flex-col gap-3">
+                {/* log header + expand button */}
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] uppercase tracking-widest text-slate-500 font-semibold">Log</span>
+                  <button
+                    onClick={() => setLogExpanded(true)}
+                    title="Expand log to full screen"
+                    className="flex items-center gap-1 rounded-lg bg-slate-700 px-2 py-1 text-[10px] text-slate-400 hover:bg-slate-600 hover:text-white transition-colors"
+                  >
+                    <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                        d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5v-4m0 4h-4m4 0l-5-5" />
+                    </svg>
+                    Expand
+                  </button>
+                </div>
                 <div className="h-48 overflow-y-auto rounded-xl bg-slate-900 px-3 py-2 font-mono text-xs space-y-0.5 border border-slate-700">
                   {log.length === 0 && <p className="text-slate-600 italic">No data yet…</p>}
                   {log.map((entry) => (
@@ -1417,6 +1433,44 @@ export default function Home() {
         </div>
 
       </div>
+
+      {/* ── Fullscreen log overlay ──────────────────────────────── */}
+      {logExpanded && (
+        <div className="fixed inset-0 z-50 flex flex-col bg-slate-950">
+          {/* header bar */}
+          <div className="flex items-center justify-between px-4 py-3 border-b border-slate-700 shrink-0">
+            <span className="text-xs font-semibold uppercase tracking-widest text-slate-400">BLE Terminal Log</span>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setLog([])}
+                className="rounded-lg bg-slate-700 px-3 py-1.5 text-xs text-slate-400 hover:bg-red-900/60 hover:text-red-300 transition-colors"
+              >
+                Clear
+              </button>
+              <button
+                onClick={() => setLogExpanded(false)}
+                title="Close full screen"
+                className="flex items-center gap-1 rounded-lg bg-slate-700 px-3 py-1.5 text-xs text-slate-300 hover:bg-slate-600 hover:text-white transition-colors"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+                Close
+              </button>
+            </div>
+          </div>
+          {/* scrollable entries */}
+          <div className="flex-1 overflow-y-auto px-4 py-3 font-mono text-xs space-y-0.5">
+            {log.length === 0 && <p className="text-slate-600 italic">No data yet…</p>}
+            {log.map((entry) => (
+              <p key={entry.id} className={logColor(entry.dir)}>
+                <span className="text-slate-600">{logPrefix(entry.dir)}</span>
+                {entry.text}
+              </p>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
