@@ -4,3 +4,6 @@ project(':capacitor-android').projectDir = new File('../node_modules/@capacitor/
 
 include ':capacitor-community-bluetooth-le'
 project(':capacitor-community-bluetooth-le').projectDir = new File('../node_modules/@capacitor-community/bluetooth-le/android')
+
+include ':yesprasoon-capacitor-bluetooth-communication'
+project(':yesprasoon-capacitor-bluetooth-communication').projectDir = new File('../node_modules/@yesprasoon/capacitor-bluetooth-communication/android')

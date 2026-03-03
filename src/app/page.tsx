@@ -2,6 +2,8 @@
 
 import { useState, useCallback, useEffect, useRef } from "react";
 import { BluetoothCommunication } from "@yesprasoon/capacitor-bluetooth-communication";
+import { BleClient } from "@capacitor-community/bluetooth-le";
+import type { BleService } from "@capacitor-community/bluetooth-le";
 
 type AppState = "idle" | "scanning" | "device_list" | "connecting" | "connected" | "error";
 
@@ -203,6 +205,36 @@ function parseBattery(raw: string): { level: number; charging: boolean } | null 
   return null;
 }
 
+// ── BLE UUIDs (standard Battery Service) ─────────────────────────────
+const BLE_BATTERY_SVC  = "0000180f-0000-1000-8000-00805f9b34fb";
+const BLE_BATTERY_CHAR = "00002a19-0000-1000-8000-00805f9b34fb";
+
+/** Parse an incoming BLE notification into a typed result — pure function. */
+function parseBleDataView(
+  bytes: Uint8Array,
+  svcUuid: string,
+  chrUuid: string,
+): | { type: "battery"; level: number; charging: boolean }
+   | { type: "media"; images: number; videos: number; recordings: number }
+   | { type: "raw"; hex: string; chrId: string } {
+  // Standard BLE Battery Service → single byte 0–100
+  if (svcUuid.startsWith("0000180f") && chrUuid.startsWith("00002a19")) {
+    return { type: "battery", level: bytes[0] ?? 0, charging: false };
+  }
+  // Orange SDK: battery report — cmdType 0x05 at loadData[6]
+  if (bytes.length >= 9 && bytes[6] === 0x05) {
+    return { type: "battery", level: bytes[7], charging: bytes[8] !== 0 };
+  }
+  // Orange SDK: media count — cmdType 0x04 at loadData[6]
+  if (bytes.length >= 10 && bytes[6] === 0x04) {
+    return { type: "media", images: bytes[7], videos: bytes[8], recordings: bytes[9] };
+  }
+  const hex = Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, "0").toUpperCase())
+    .join(" ");
+  return { type: "raw", hex, chrId: chrUuid.slice(4, 8) };
+}
+
 export default function Home() {
   const [appState, setAppState] = useState<AppState>("idle");
   const [statusMsg, setStatusMsg] = useState("Tap 'Scan' to find paired devices.");
@@ -231,6 +263,12 @@ export default function Home() {
   // Media counts (from binary glassesControl [0x02, 0x04] response)
   const [mediaCounts, setMediaCounts] = useState<MediaCounts | null>(null);
   const [isCheckingMedia, setIsCheckingMedia] = useState(false);
+  // BLE state — battery + media count come via BLE GATT (Orange SDK uses BLE, not RFCOMM)
+  const [bleConnected, setBleConnected] = useState(false);
+  const [bleStatus, setBleStatus] = useState<"idle" | "connecting" | "connected" | "error">("idle");
+  const [bleServices, setBleServices] = useState<BleService[]>([]);
+  const [bleWriteSvc, setBleWriteSvc] = useState<string | null>(null);
+  const [bleWriteChar, setBleWriteChar] = useState<string | null>(null);
   const logEndRef = useRef<HTMLDivElement>(null);
   const listenerRef = useRef<{ remove: () => void } | null>(null);
   const rxBufferRef = useRef<string>("");
@@ -240,6 +278,7 @@ export default function Home() {
   const listBufferRef = useRef<string>("");
   const listTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isListingRef = useRef<boolean>(false);
+  const bleDeviceIdRef = useRef<string | null>(null);
 
   const addLog = useCallback((dir: LogEntry["dir"], text: string) => {
     setLog((prev) => [...prev, { id: logCounter++, dir, text }]);
@@ -306,6 +345,93 @@ export default function Home() {
       buf = buf.substring(endIdx + endSearch.length);
     }
     rxBufferRef.current = buf;
+  }, [addLog]);
+
+  // ── BLE connect (battery + media count via GATT) ──────────────────
+  // Auto-called after Classic BT connects, using the same MAC address.
+  const handleBleConnect = useCallback(async (address: string) => {
+    setBleStatus("connecting");
+    setBleServices([]);
+    setBleWriteSvc(null);
+    setBleWriteChar(null);
+    bleDeviceIdRef.current = null;
+    try {
+      await BleClient.initialize({ androidNeverForLocation: true });
+      await BleClient.connect(address, () => {
+        setBleConnected(false);
+        setBleStatus("idle");
+        bleDeviceIdRef.current = null;
+        addLog("sys", "BLE disconnected.");
+      });
+      bleDeviceIdRef.current = address;
+      setBleConnected(true);
+      setBleStatus("connected");
+      addLog("sys", "BLE connected — discovering services…");
+
+      const services = await BleClient.getServices(address);
+      setBleServices(services);
+
+      let foundWriteSvc: string | null = null;
+      let foundWriteChar: string | null = null;
+
+      for (const svc of services) {
+        const isStandard =
+          svc.uuid.startsWith("00001800") ||
+          svc.uuid.startsWith("00001801") ||
+          svc.uuid.startsWith("0000180f");
+
+        for (const chr of svc.characteristics ?? []) {
+          // First writable char on a proprietary service = command channel
+          if (!isStandard && !foundWriteSvc &&
+              (chr.properties.write || chr.properties.writeWithoutResponse)) {
+            foundWriteSvc  = svc.uuid;
+            foundWriteChar = chr.uuid;
+          }
+          // Subscribe to every notify/indicate characteristic
+          if (chr.properties.notify || chr.properties.indicate) {
+            try {
+              const capSvc = svc.uuid;
+              const capChr = chr.uuid;
+              await BleClient.startNotifications(address, capSvc, capChr, (dv) => {
+                const bytes = new Uint8Array(dv.buffer);
+                const result = parseBleDataView(bytes, capSvc, capChr);
+                if (result.type === "battery") {
+                  setBatteryLevel(result.level);
+                  setIsCharging(result.charging);
+                } else if (result.type === "media") {
+                  setMediaCounts({ images: result.images, videos: result.videos, recordings: result.recordings });
+                  setIsCheckingMedia(false);
+                  addLog("sys", `BLE media: ${result.images} img · ${result.videos} vid · ${result.recordings} rec`);
+                } else {
+                  addLog("sys", `BLE [${result.chrId}]: ${result.hex}`);
+                }
+              });
+            } catch { /* characteristic not subscribable — skip */ }
+          }
+        }
+      }
+
+      setBleWriteSvc(foundWriteSvc);
+      setBleWriteChar(foundWriteChar);
+
+      // Immediately read standard Battery Service if present
+      if (services.some((s) => s.uuid.startsWith("0000180f"))) {
+        try {
+          const dv = await BleClient.read(address, BLE_BATTERY_SVC, BLE_BATTERY_CHAR);
+          setBatteryLevel(dv.getUint8(0));
+          addLog("sys", `BLE Battery (standard service): ${dv.getUint8(0)}%`);
+        } catch { /* will arrive via notification */ }
+      }
+
+      addLog("sys",
+        `BLE ready · ${services.length} service(s) · ${
+          foundWriteSvc ? "write char found ✓" : "no writable char found"}`
+      );
+    } catch (err: unknown) {
+      setBleStatus("error");
+      setBleConnected(false);
+      addLog("sys", `BLE connect failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }, [addLog]);
 
   // ── Scan for paired devices ────────────────────────────────────────
@@ -412,6 +538,8 @@ export default function Home() {
         setAppState("connected");
         setStatusMsg(`Connected to ${device.name || device.address}`);
         addLog("sys", `Connected to ${device.name || device.address}`);
+        // Auto-connect BLE to the same address for battery + media count via GATT
+        void handleBleConnect(device.address);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         setStatusMsg(`Connection failed: ${msg}`);
@@ -420,7 +548,7 @@ export default function Home() {
         setIsBusy(false);
       }
     },
-    [addLog]
+    [addLog, handleBleConnect]
   );
 
   // ── Send data ──────────────────────────────────────────────────────
@@ -444,10 +572,18 @@ export default function Home() {
       listenerRef.current?.remove();
       listenerRef.current = null;
       await BluetoothCommunication.disconnect();
-      addLog("sys", "Disconnected.");
-    } catch {
-      // ignore
-    }
+    } catch { /* ignore */ }
+    // Also disconnect BLE
+    try {
+      if (bleDeviceIdRef.current) await BleClient.disconnect(bleDeviceIdRef.current);
+    } catch { /* ignore */ }
+    bleDeviceIdRef.current = null;
+    setBleConnected(false);
+    setBleStatus("idle");
+    setBleServices([]);
+    setBleWriteSvc(null);
+    setBleWriteChar(null);
+    addLog("sys", "Disconnected.");
     // Free blob URLs allocated for received files
     receivedFilesRef.current.forEach((f) => URL.revokeObjectURL(f.url));
     receivedFilesRef.current = [];
@@ -473,42 +609,54 @@ export default function Home() {
     setIsBusy(false);
   }, [addLog]);
 
-  // ── Request battery level from device ─────────────────────────────
-  // Sends binary syncBattery command [0x02, 0x05] per Orange Wireless SDK.
-  // If the user has typed a custom AT command in the bat cmd field, that is
-  // sent instead (allows fallback for non-SDK-standard glasses).
+  // ── Request battery level ────────────────────────────────────────
+  // BLE path (correct): write [0x02, 0x05] → syncBattery() via GATT.
+  // Fallback: custom AT text command over Classic BT if user provides one.
   const handleRequestBattery = useCallback(async () => {
-    try {
-      if (batCmd.trim().length > 0) {
-        // User has a custom text command — send it
+    if (bleConnected && bleDeviceIdRef.current && bleWriteSvc && bleWriteChar) {
+      try {
+        const dv = new DataView(new Uint8Array([0x02, 0x05]).buffer);
+        await BleClient.write(bleDeviceIdRef.current, bleWriteSvc, bleWriteChar, dv);
+        addLog("sys", "BLE → syncBattery() [02 05] — waiting for notification…");
+        return;
+      } catch (err: unknown) {
+        addLog("sys", `BLE write failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (batCmd.trim().length > 0) {
+      try {
         const cmd = batCmd.replace(/\\r/g, "\r").replace(/\\n/g, "\n");
         await BluetoothCommunication.sendData({ data: cmd });
-        addLog("tx", `Battery cmd (custom): ${JSON.stringify(batCmd.trim())}`);
-      } else {
-        // Default: binary syncBattery() per SDK
-        const binary = String.fromCharCode(0x02, 0x05);
-        await BluetoothCommunication.sendData({ data: binary });
-        addLog("tx", "Battery sync: [02 05] (binary syncBattery)");
+        addLog("tx", `Battery cmd (AT fallback): ${JSON.stringify(batCmd.trim())}`);
+      } catch (err: unknown) {
+        addLog("sys", `Battery request failed: ${err instanceof Error ? err.message : String(err)}`);
       }
-    } catch (err: unknown) {
-      addLog("sys", `Battery request failed: ${err instanceof Error ? err.message : String(err)}`);
+    } else {
+      addLog("sys", "BLE not connected yet — battery will appear once BLE connects.");
     }
-  }, [addLog, batCmd]);
+  }, [addLog, batCmd, bleConnected, bleWriteSvc, bleWriteChar]);
 
-  // ── Check un-synced media count [0x02, 0x04] ──────────────────────
+  // ── Check un-synced media count via BLE glassesControl([0x02, 0x04]) ──
   const handleCheckMedia = useCallback(async () => {
+    if (!bleConnected || !bleDeviceIdRef.current) {
+      addLog("sys", "BLE not connected — cannot check media count (needs BLE GATT).");
+      return;
+    }
+    if (!bleWriteSvc || !bleWriteChar) {
+      addLog("sys", "No writable BLE characteristic found. Reconnect and try again.");
+      return;
+    }
     setIsCheckingMedia(true);
     try {
-      const binary = String.fromCharCode(0x02, 0x04);
-      await BluetoothCommunication.sendData({ data: binary });
-      addLog("tx", "Media check: [02 04] (glassesControl)");
-      // Safety timeout: clear spinner after 10 s if no response
+      const dv = new DataView(new Uint8Array([0x02, 0x04]).buffer);
+      await BleClient.write(bleDeviceIdRef.current, bleWriteSvc, bleWriteChar, dv);
+      addLog("sys", "BLE → glassesControl([02 04]) — waiting for media count…");
       setTimeout(() => setIsCheckingMedia(false), 10000);
     } catch (err: unknown) {
       setIsCheckingMedia(false);
-      addLog("sys", `Media check failed: ${err instanceof Error ? err.message : String(err)}`);
+      addLog("sys", `BLE media check failed: ${err instanceof Error ? err.message : String(err)}`);
     }
-  }, [addLog]);
+  }, [addLog, bleConnected, bleWriteSvc, bleWriteChar]);
 
   // ── Send a file over RFCOMM (base64-chunked framing protocol) ─────
   const handleFileChange = useCallback(
@@ -703,9 +851,23 @@ export default function Home() {
                   )}
                 </div>
                 <div className="flex-1 min-w-0">
-                  <p className="text-xs font-semibold uppercase tracking-widest text-slate-500">
-                    Battery{isCharging && <span className="ml-1.5 text-yellow-400 font-bold">&#9889; Charging</span>}
-                  </p>
+                  <div className="flex items-center gap-2">
+                    <p className="text-xs font-semibold uppercase tracking-widest text-slate-500">
+                      Battery{isCharging && <span className="ml-1 text-yellow-400">&#9889;</span>}
+                    </p>
+                    <span className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-bold
+                      ${ bleStatus === "connected"  ? "bg-emerald-500/20 text-emerald-400"
+                        : bleStatus === "connecting" ? "bg-yellow-500/20 text-yellow-400"
+                        : bleStatus === "error"      ? "bg-red-500/20 text-red-400"
+                        : "bg-slate-700 text-slate-500" }`}>
+                      <span className={`w-1.5 h-1.5 rounded-full ${
+                        bleStatus === "connected"  ? "bg-emerald-400"
+                        : bleStatus === "connecting" ? "bg-yellow-400 animate-pulse"
+                        : bleStatus === "error"      ? "bg-red-400"
+                        : "bg-slate-500" }`} />
+                      BLE
+                    </span>
+                  </div>
                   <p className={`text-2xl font-black tabular-nums leading-none mt-0.5 ${batteryTextColor}`}>
                     {batteryLevel !== null ? `${batteryLevel}%` : "--"}
                   </p>
@@ -951,8 +1113,9 @@ export default function Home() {
                     <p className="text-xs font-semibold uppercase tracking-widest text-slate-400">Un-synced Media</p>
                     <button
                       onClick={handleCheckMedia}
-                      disabled={isCheckingMedia}
-                      className="flex items-center gap-1.5 rounded-lg bg-violet-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-violet-500 active:scale-95 transition-all disabled:opacity-60"
+                      disabled={isCheckingMedia || !bleConnected}
+                      title={!bleConnected ? "Waiting for BLE connection (auto-connects after Classic BT)" : "Query glasses for un-synced media via BLE"}
+                      className="flex items-center gap-1.5 rounded-lg bg-violet-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-violet-500 active:scale-95 transition-all disabled:opacity-50"
                     >
                       {isCheckingMedia ? (
                         <>
